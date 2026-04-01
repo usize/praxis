@@ -1,0 +1,16 @@
+[package]
+name = "praxis-ai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "AI filters and capabilities for the Praxis proxy"
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+praxis-core = { workspace = true }
+praxis-filter = { workspace = true }
