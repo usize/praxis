@@ -419,8 +419,8 @@ deferred_close_timeout_ms: 10000"#,
 }
 
 #[tokio::test]
-async fn rejects_all_request_body_send_mode_variants() {
-    for mode in ["streamed", "buffered", "buffered_partial", "full_duplex_streamed"] {
+async fn rejects_buffered_request_body_mode() {
+    for mode in ["buffered", "buffered_partial"] {
         let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
             r#"
 target: "http://127.0.0.1:50051"
@@ -437,14 +437,14 @@ processing_mode:
         );
         assert!(
             err.to_string().contains("not yet supported"),
-            "{mode} should parse but fail validation: {err}"
+            "{mode} should fail validation: {err}"
         );
     }
 }
 
 #[tokio::test]
-async fn rejects_all_response_body_send_mode_variants() {
-    for mode in ["streamed", "buffered", "buffered_partial", "full_duplex_streamed"] {
+async fn rejects_buffered_response_body_mode() {
+    for mode in ["buffered", "buffered_partial"] {
         let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
             r#"
 target: "http://127.0.0.1:50051"
@@ -461,9 +461,47 @@ processing_mode:
         );
         assert!(
             err.to_string().contains("not yet supported"),
-            "{mode} should parse but fail validation: {err}"
+            "{mode} should fail validation: {err}"
         );
     }
+}
+
+#[tokio::test]
+async fn accepts_streamed_body_modes() {
+    for mode in ["streamed", "full_duplex_streamed"] {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            r#"
+target: "http://127.0.0.1:50051"
+processing_mode:
+  request_body_mode: {mode}
+  response_body_mode: {mode}
+"#,
+        ))
+        .unwrap();
+
+        let result = ExtProcFilter::from_config(&yaml);
+        assert!(
+            result.is_ok(),
+            "{mode} body mode should be accepted, got error: {}",
+            result.err().map_or_else(|| "none".to_owned(), |e| e.to_string())
+        );
+    }
+}
+
+#[tokio::test]
+async fn full_duplex_streamed_config_accepted() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+target: "http://127.0.0.1:50051"
+processing_mode:
+  request_body_mode: full_duplex_streamed
+  response_body_mode: full_duplex_streamed
+"#,
+    )
+    .unwrap();
+
+    let filter = ExtProcFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.name(), "ext_proc");
 }
 
 #[tokio::test]
@@ -901,6 +939,52 @@ fn response_to_proto_headers_empty_when_no_response() {
         headers.is_empty(),
         "headers should be empty when response_header is None"
     );
+}
+
+// -----------------------------------------------------------------------------
+// Proto Conversion: body -> ProcessingRequest
+// -----------------------------------------------------------------------------
+
+#[test]
+fn request_body_to_request_wraps_body_bytes() {
+    let body = Some(Bytes::from("hello"));
+    let req = mutations::request_body_to_request(&body, false);
+
+    match req.request {
+        Some(processing_request::Request::RequestBody(hb)) => {
+            assert_eq!(hb.body, b"hello", "body bytes should match");
+            assert!(!hb.end_of_stream, "end_of_stream should be false");
+        },
+        other => panic!("expected RequestBody, got {other:?}"),
+    }
+}
+
+#[test]
+fn request_body_to_request_empty_when_none() {
+    let body = None;
+    let req = mutations::request_body_to_request(&body, true);
+
+    match req.request {
+        Some(processing_request::Request::RequestBody(hb)) => {
+            assert!(hb.body.is_empty(), "body should be empty for None");
+            assert!(hb.end_of_stream, "end_of_stream should be true");
+        },
+        other => panic!("expected RequestBody, got {other:?}"),
+    }
+}
+
+#[test]
+fn response_body_to_request_wraps_body_bytes() {
+    let body = Some(Bytes::from("world"));
+    let req = mutations::response_body_to_request(&body, true);
+
+    match req.request {
+        Some(processing_request::Request::ResponseBody(hb)) => {
+            assert_eq!(hb.body, b"world", "body bytes should match");
+            assert!(hb.end_of_stream, "end_of_stream should be true");
+        },
+        other => panic!("expected ResponseBody, got {other:?}"),
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1353,6 +1437,146 @@ fn response_header_both_unset_defaults_to_append() {
 }
 
 // -----------------------------------------------------------------------------
+// Mutation: apply_body_response
+// -----------------------------------------------------------------------------
+
+#[test]
+fn apply_body_response_replaces_body() {
+    use praxis_proto::envoy::service::ext_proc::v3::{BodyMutation, BodyResponse, body_mutation};
+
+    let req = make_request(Method::GET, "/");
+    let mut ctx = make_ctx(&req);
+    let mut body = Some(Bytes::from("original"));
+
+    let br = BodyResponse {
+        response: Some(CommonResponse {
+            status: 0,
+            header_mutation: None,
+            body_mutation: Some(BodyMutation {
+                mutation: Some(body_mutation::Mutation::Body(b"replaced".to_vec())),
+            }),
+            trailers: None,
+            clear_route_cache: false,
+        }),
+    };
+
+    let action = mutations::apply_body_response(&br, &mut ctx, &mut body, Phase::Request).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue), "action should be Continue");
+    assert_eq!(body.unwrap(), Bytes::from("replaced"), "body should be replaced");
+}
+
+#[test]
+fn apply_body_response_clears_body() {
+    use praxis_proto::envoy::service::ext_proc::v3::{BodyMutation, BodyResponse, body_mutation};
+
+    let req = make_request(Method::GET, "/");
+    let mut ctx = make_ctx(&req);
+    let mut body = Some(Bytes::from("original"));
+
+    let br = BodyResponse {
+        response: Some(CommonResponse {
+            status: 0,
+            header_mutation: None,
+            body_mutation: Some(BodyMutation {
+                mutation: Some(body_mutation::Mutation::ClearBody(true)),
+            }),
+            trailers: None,
+            clear_route_cache: false,
+        }),
+    };
+
+    let action = mutations::apply_body_response(&br, &mut ctx, &mut body, Phase::Request).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue), "action should be Continue");
+    assert!(body.is_none(), "body should be cleared");
+}
+
+#[test]
+fn apply_body_response_streamed_replaces_body() {
+    use praxis_proto::envoy::service::ext_proc::v3::{BodyMutation, BodyResponse, StreamedBodyResponse, body_mutation};
+
+    let req = make_request(Method::GET, "/");
+    let mut ctx = make_ctx(&req);
+    let mut body = Some(Bytes::from("original"));
+
+    let br = BodyResponse {
+        response: Some(CommonResponse {
+            status: 0,
+            header_mutation: None,
+            body_mutation: Some(BodyMutation {
+                mutation: Some(body_mutation::Mutation::StreamedResponse(StreamedBodyResponse {
+                    body: b"streamed-chunk".to_vec(),
+                    end_of_stream: false,
+                })),
+            }),
+            trailers: None,
+            clear_route_cache: false,
+        }),
+    };
+
+    let action = mutations::apply_body_response(&br, &mut ctx, &mut body, Phase::Request).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue), "action should be Continue");
+    assert_eq!(
+        body.unwrap(),
+        Bytes::from("streamed-chunk"),
+        "body should be replaced with streamed chunk"
+    );
+}
+
+#[test]
+fn apply_body_response_applies_header_mutation() {
+    use praxis_proto::envoy::service::ext_proc::v3::BodyResponse;
+
+    let req = make_request(Method::GET, "/");
+    let mut ctx = make_ctx(&req);
+    let mut body = Some(Bytes::from("data"));
+
+    let br = BodyResponse {
+        response: Some(CommonResponse {
+            status: 0,
+            header_mutation: Some(HeaderMutation {
+                set_headers: vec![make_hvo("x-body-phase", "injected")],
+                remove_headers: vec![],
+            }),
+            body_mutation: None,
+            trailers: None,
+            clear_route_cache: false,
+        }),
+    };
+
+    let action = mutations::apply_body_response(&br, &mut ctx, &mut body, Phase::Request).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue), "action should be Continue");
+    assert_eq!(
+        ctx.extra_request_headers.len(),
+        1,
+        "should inject header during body phase"
+    );
+    assert_eq!(
+        ctx.extra_request_headers[0].0, "x-body-phase",
+        "header name should match"
+    );
+}
+
+#[test]
+fn apply_body_response_noop_when_no_common_response() {
+    use praxis_proto::envoy::service::ext_proc::v3::BodyResponse;
+
+    let req = make_request(Method::GET, "/");
+    let mut ctx = make_ctx(&req);
+    let mut body = Some(Bytes::from("unchanged"));
+
+    let br = BodyResponse { response: None };
+
+    let action = mutations::apply_body_response(&br, &mut ctx, &mut body, Phase::Request).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue), "action should be Continue");
+    assert_eq!(body.unwrap(), Bytes::from("unchanged"), "body should be unchanged");
+}
+
+// -----------------------------------------------------------------------------
 // Mutation: immediate_to_rejection
 // -----------------------------------------------------------------------------
 
@@ -1554,12 +1778,14 @@ async fn grpc_request_headers_round_trip_applies_mutation() {
     .await;
 
     let channel = connect_channel(addr).await;
+    let timeout = Duration::from_secs(5);
+
+    let handle = callout::open_stream(channel, addr.to_string());
 
     let req = make_request(Method::GET, "/test");
     let mut ctx = make_ctx(&req);
-    let timeout = Duration::from_secs(5);
 
-    let action = callout::process_request_headers(channel, &addr.to_string(), timeout, None, &mut ctx)
+    let action = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx)
         .await
         .expect("callout should succeed");
 
@@ -1585,14 +1811,16 @@ async fn grpc_response_headers_round_trip_applies_mutation() {
     .await;
 
     let channel = connect_channel(addr).await;
+    let timeout = Duration::from_secs(5);
+
+    let handle = callout::open_stream(channel, addr.to_string());
 
     let req = make_request(Method::GET, "/");
     let mut resp = make_response();
     let mut ctx = make_ctx(&req);
     ctx.response_header = Some(&mut resp);
-    let timeout = Duration::from_secs(5);
 
-    let action = callout::process_response_headers(channel, &addr.to_string(), timeout, None, &mut ctx)
+    let action = callout::process_response_headers(&handle, &addr.to_string(), timeout, None, &mut ctx)
         .await
         .expect("callout should succeed");
 
@@ -1618,12 +1846,14 @@ async fn grpc_immediate_response_returns_rejection() {
     .await;
 
     let channel = connect_channel(addr).await;
+    let timeout = Duration::from_secs(5);
+
+    let handle = callout::open_stream(channel, addr.to_string());
 
     let req = make_request(Method::GET, "/secret");
     let mut ctx = make_ctx(&req);
-    let timeout = Duration::from_secs(5);
 
-    let action = callout::process_request_headers(channel, &addr.to_string(), timeout, None, &mut ctx)
+    let action = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx)
         .await
         .expect("callout should succeed");
 
@@ -1644,12 +1874,14 @@ async fn grpc_noop_response_returns_continue() {
     let (addr, _guard) = start_mock_processor(MockBehavior::Noop).await;
 
     let channel = connect_channel(addr).await;
+    let timeout = Duration::from_secs(5);
+
+    let handle = callout::open_stream(channel, addr.to_string());
 
     let req = make_request(Method::GET, "/");
     let mut ctx = make_ctx(&req);
-    let timeout = Duration::from_secs(5);
 
-    let action = callout::process_request_headers(channel, &addr.to_string(), timeout, None, &mut ctx)
+    let action = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx)
         .await
         .expect("callout should succeed");
 
@@ -1673,7 +1905,9 @@ async fn grpc_unexpected_response_type_returns_error() {
     let mut ctx = make_ctx(&req);
     let timeout = Duration::from_secs(5);
 
-    let result = callout::process_request_headers(channel, &addr.to_string(), timeout, None, &mut ctx).await;
+    let handle = callout::open_stream(channel, addr.to_string());
+
+    let result = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx).await;
 
     assert!(result.is_err(), "unexpected response type should return Err");
     let err = result.unwrap_err().to_string();
@@ -1694,7 +1928,9 @@ async fn grpc_phase_mismatched_response_returns_error() {
     let mut ctx = make_ctx(&req);
     let timeout = Duration::from_secs(5);
 
-    let result = callout::process_request_headers(channel, &addr.to_string(), timeout, None, &mut ctx).await;
+    let handle = callout::open_stream(channel, addr.to_string());
+
+    let result = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx).await;
 
     assert!(result.is_err(), "phase-mismatched response should return Err");
     let err = result.unwrap_err().to_string();
@@ -1709,12 +1945,14 @@ async fn grpc_timeout_returns_error() {
     let (addr, _guard) = start_mock_processor(MockBehavior::Hang).await;
 
     let channel = connect_channel(addr).await;
+    let timeout = Duration::from_millis(50);
+
+    let handle = callout::open_stream(channel, addr.to_string());
 
     let req = make_request(Method::GET, "/");
     let mut ctx = make_ctx(&req);
-    let timeout = Duration::from_millis(50);
 
-    let result = callout::process_request_headers(channel, &addr.to_string(), timeout, None, &mut ctx).await;
+    let result = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx).await;
 
     assert!(result.is_err(), "timed-out callout should return Err");
     let err = result.unwrap_err().to_string();
@@ -1762,12 +2000,14 @@ async fn grpc_override_timeout_extends_deadline() {
 
     let channel = connect_channel(addr).await;
 
+    let handle = callout::open_stream(channel, addr.to_string());
+
     let req = make_request(Method::GET, "/");
     let mut ctx = make_ctx(&req);
     let timeout = Duration::from_secs(5);
     let max_timeout = Some(Duration::from_secs(10));
 
-    let action = callout::process_request_headers(channel, &addr.to_string(), timeout, max_timeout, &mut ctx)
+    let action = callout::process_request_headers(&handle, &addr.to_string(), timeout, max_timeout, &mut ctx)
         .await
         .expect("callout with override should succeed");
 
@@ -1793,11 +2033,13 @@ async fn grpc_override_ignored_without_max_timeout() {
 
     let channel = connect_channel(addr).await;
 
+    let handle = callout::open_stream(channel, addr.to_string());
+
     let req = make_request(Method::GET, "/");
     let mut ctx = make_ctx(&req);
     let timeout = Duration::from_secs(5);
 
-    let action = callout::process_request_headers(channel, &addr.to_string(), timeout, None, &mut ctx)
+    let action = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx)
         .await
         .expect("callout should succeed");
 
@@ -1812,8 +2054,281 @@ async fn grpc_override_ignored_without_max_timeout() {
 }
 
 // -----------------------------------------------------------------------------
+// gRPC Full-Lifecycle Integration
+// -----------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_stream_full_lifecycle() {
+    let (addr, _guard) = start_mock_processor(MockBehavior::FullLifecycle).await;
+    let channel = connect_channel(addr).await;
+    let timeout = Duration::from_secs(5);
+    let target = addr.to_string();
+    let handle = callout::open_stream(channel, target.clone());
+    let req = make_request(Method::POST, "/api");
+    let mut ctx = make_ctx(&req);
+    assert_continue(
+        callout::process_request_headers(&handle, &target, timeout, None, &mut ctx).await,
+        "request headers",
+    );
+    let mut body = Some(Bytes::from("request-body"));
+    assert_continue(
+        callout::process_request_body(&handle, &target, timeout, None, &mut ctx, &mut body, true).await,
+        "request body",
+    );
+    let mut resp = make_response();
+    ctx.response_header = Some(&mut resp);
+    assert_continue(
+        callout::process_response_headers(&handle, &target, timeout, None, &mut ctx).await,
+        "response headers",
+    );
+    let mut body = Some(Bytes::from("response-body"));
+    assert_continue(
+        callout::process_response_body(&handle, &target, timeout, None, &mut ctx, &mut body, true),
+        "response body",
+    );
+}
+
+#[tokio::test]
+async fn request_body_mutation_replaces_body() {
+    let (addr, _guard) = start_mock_processor(MockBehavior::EchoBody).await;
+
+    let channel = connect_channel(addr).await;
+    let timeout = Duration::from_secs(5);
+    let target = addr.to_string();
+
+    let handle = callout::open_stream(channel, target.clone());
+
+    let req = make_request(Method::POST, "/");
+    let mut ctx = make_ctx(&req);
+
+    let _action = callout::process_request_headers(&handle, &target, timeout, None, &mut ctx)
+        .await
+        .expect("headers should succeed");
+
+    let mut body = Some(Bytes::from("original-body"));
+    let action = callout::process_request_body(&handle, &target, timeout, None, &mut ctx, &mut body, true)
+        .await
+        .expect("body should succeed");
+
+    assert!(matches!(action, FilterAction::Continue), "action should be Continue");
+    assert_eq!(
+        body.unwrap(),
+        Bytes::from("echo:original-body"),
+        "body should be replaced with echoed content"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_body_mutation_replaces_body() {
+    let (addr, _guard) = start_mock_processor(MockBehavior::EchoBody).await;
+
+    let channel = connect_channel(addr).await;
+    let timeout = Duration::from_secs(5);
+    let target = addr.to_string();
+
+    let handle = callout::open_stream(channel, target.clone());
+
+    let req = make_request(Method::GET, "/");
+    let mut ctx = make_ctx(&req);
+
+    let _action = callout::process_request_headers(&handle, &target, timeout, None, &mut ctx)
+        .await
+        .expect("request headers should succeed");
+
+    let mut resp = make_response();
+    ctx.response_header = Some(&mut resp);
+    let _action = callout::process_response_headers(&handle, &target, timeout, None, &mut ctx)
+        .await
+        .expect("response headers should succeed");
+
+    let mut body = Some(Bytes::from("resp-original"));
+    let action = callout::process_response_body(&handle, &target, timeout, None, &mut ctx, &mut body, true)
+        .expect("response body should succeed");
+
+    assert!(matches!(action, FilterAction::Continue), "action should be Continue");
+    assert_eq!(
+        body.unwrap(),
+        Bytes::from("echo:resp-original"),
+        "response body should be replaced with echoed content"
+    );
+}
+
+#[tokio::test]
+async fn request_body_clear_body() {
+    let (addr, _guard) = start_mock_processor(MockBehavior::ClearBody).await;
+
+    let channel = connect_channel(addr).await;
+    let timeout = Duration::from_secs(5);
+    let target = addr.to_string();
+
+    let handle = callout::open_stream(channel, target.clone());
+
+    let req = make_request(Method::POST, "/");
+    let mut ctx = make_ctx(&req);
+
+    let _action = callout::process_request_headers(&handle, &target, timeout, None, &mut ctx)
+        .await
+        .expect("headers should succeed");
+
+    let mut body = Some(Bytes::from("should-be-cleared"));
+    let action = callout::process_request_body(&handle, &target, timeout, None, &mut ctx, &mut body, true)
+        .await
+        .expect("body should succeed");
+
+    assert!(matches!(action, FilterAction::Continue), "action should be Continue");
+    assert!(body.is_none(), "body should be cleared");
+}
+
+#[tokio::test]
+async fn immediate_response_during_body_phase() {
+    let (addr, _guard) = start_mock_processor(MockBehavior::ImmediateOnBody {
+        status: 429,
+        body: "rate limited".to_owned(),
+    })
+    .await;
+
+    let channel = connect_channel(addr).await;
+    let timeout = Duration::from_secs(5);
+    let target = addr.to_string();
+
+    let handle = callout::open_stream(channel, target.clone());
+
+    let req = make_request(Method::POST, "/");
+    let mut ctx = make_ctx(&req);
+
+    let _action = callout::process_request_headers(&handle, &target, timeout, None, &mut ctx)
+        .await
+        .expect("headers should succeed");
+
+    let mut body = Some(Bytes::from("data"));
+    let action = callout::process_request_body(&handle, &target, timeout, None, &mut ctx, &mut body, false)
+        .await
+        .expect("body should succeed");
+
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject during body phase, got {other:?}"),
+    };
+    assert_eq!(rejection.status, 429, "rejection status should match");
+    assert_eq!(
+        rejection.body.unwrap(),
+        Bytes::from("rate limited"),
+        "rejection body should match"
+    );
+}
+
+#[tokio::test]
+async fn body_mode_none_skips_processing() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+target: "http://127.0.0.1:50051"
+processing_mode:
+  request_body_mode: none
+  response_body_mode: none
+"#,
+    )
+    .unwrap();
+
+    let filter = ExtProcFilter::from_config(&yaml).unwrap();
+
+    assert_eq!(
+        filter.request_body_access(),
+        BodyAccess::None,
+        "request body access should be None when body mode is none"
+    );
+    assert_eq!(
+        filter.response_body_access(),
+        BodyAccess::None,
+        "response body access should be None when body mode is none"
+    );
+}
+
+#[tokio::test]
+async fn body_mode_streamed_enables_read_write() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+target: "http://127.0.0.1:50051"
+processing_mode:
+  request_body_mode: streamed
+  response_body_mode: streamed
+"#,
+    )
+    .unwrap();
+
+    let filter = ExtProcFilter::from_config(&yaml).unwrap();
+
+    assert_eq!(
+        filter.request_body_access(),
+        BodyAccess::ReadWrite,
+        "request body access should be ReadWrite when body mode is streamed"
+    );
+    assert_eq!(
+        filter.response_body_access(),
+        BodyAccess::ReadWrite,
+        "response body access should be ReadWrite when body mode is streamed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_cleanup_on_end_of_stream() {
+    let (addr, _guard) = start_mock_processor(MockBehavior::FullLifecycle).await;
+    let filter = make_body_filter(connect_channel(addr).await, addr);
+    let req = make_request(Method::POST, "/");
+    let mut ctx = make_ctx(&req);
+    let _action = filter.on_request(&mut ctx).await.expect("on_request should succeed");
+    let stream_id = ExtProcFilter::get_stream_id(&ctx).expect("stream_id should be set");
+    assert!(
+        filter.stream_handles.contains_key(&stream_id),
+        "handle should exist after on_request"
+    );
+    let mut body = Some(Bytes::from("chunk"));
+    let _action = filter
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .expect("request body failed");
+    let mut resp = make_response();
+    ctx.response_header = Some(&mut resp);
+    let _action = filter.on_response(&mut ctx).await.expect("on_response failed");
+    let mut body = Some(Bytes::from("resp-chunk"));
+    let _action = filter
+        .on_response_body(&mut ctx, &mut body, true)
+        .expect("response body failed");
+    assert!(
+        !filter.stream_handles.contains_key(&stream_id),
+        "handle should be removed after eos"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
+
+/// Assert that a filter action result is [`FilterAction::Continue`].
+fn assert_continue(result: Result<FilterAction, FilterError>, phase: &str) {
+    let action = result.unwrap_or_else(|e| panic!("{phase} should succeed: {e}"));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "{phase} action should be Continue"
+    );
+}
+
+/// Build an [`ExtProcFilter`] with streamed body modes for integration tests.
+fn make_body_filter(channel: Channel, addr: SocketAddr) -> ExtProcFilter {
+    ExtProcFilter {
+        channel,
+        max_message_timeout: None,
+        message_timeout: Duration::from_secs(5),
+        processing_mode: ProcessingModeConfig {
+            request_body_mode: BodySendMode::Streamed,
+            response_body_mode: BodySendMode::Streamed,
+            ..ProcessingModeConfig::default()
+        },
+        status_on_error: 500,
+        stream_handles: DashMap::new(),
+        target: format!("http://{addr}"),
+        next_stream_id: AtomicU64::new(0),
+    }
+}
 
 /// Build a minimal [`praxis_filter::Request`].
 fn make_request(method: Method, path: &str) -> praxis_filter::Request {
@@ -1850,10 +2365,10 @@ fn make_ctx(req: &praxis_filter::Request) -> HttpFilterContext<'_> {
         kv_stores: None,
         request: req,
         request_body_bytes: 0,
-        request_body_mode: praxis_filter::BodyMode::Stream,
+        request_body_mode: BodyMode::Stream,
         request_start: Instant::now(),
         response_body_bytes: 0,
-        response_body_mode: praxis_filter::BodyMode::Stream,
+        response_body_mode: BodyMode::Stream,
         response_header: None,
         response_headers_modified: false,
         rewritten_path: None,
@@ -1945,6 +2460,18 @@ enum MockBehavior {
         name: String,
         value: String,
     },
+
+    /// Echo body chunks with a prefix, handle all phases.
+    EchoBody,
+
+    /// Clear body chunks via `ClearBody(true)`.
+    ClearBody,
+
+    /// Return `ImmediateResponse` during body phase, noop for headers.
+    ImmediateOnBody { status: i32, body: String },
+
+    /// Handle all four phases on a single persistent stream.
+    FullLifecycle,
 }
 
 /// Mock implementation of the Envoy `ExternalProcessor` gRPC service.
@@ -1960,38 +2487,101 @@ impl ExternalProcessor for MockProcessor {
         &self,
         request: tonic::Request<tonic::Streaming<ProcessingRequest>>,
     ) -> Result<tonic::Response<Self::ProcessStream>, tonic::Status> {
-        let mut stream = request.into_inner();
-        let msg = stream
-            .message()
-            .await?
-            .ok_or_else(|| tonic::Status::internal("empty request stream"))?;
+        let stream = request.into_inner();
+        let behavior = self.behavior.clone();
 
-        let responses = build_mock_responses(&self.behavior, &msg).await;
-        let output = futures::stream::iter(responses.into_iter().map(Ok));
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ProcessingResponse, tonic::Status>>(16);
+        tokio::spawn(async move { drive_mock(behavior, stream, tx).await });
+
+        let output = tokio_stream::wrappers::ReceiverStream::new(rx);
         Ok(tonic::Response::new(Box::pin(output)))
     }
 }
 
-/// Dispatch mock behavior to response builder(s).
-async fn build_mock_responses(behavior: &MockBehavior, msg: &ProcessingRequest) -> Vec<ProcessingResponse> {
-    match behavior {
-        MockBehavior::Hang => {
-            futures::future::pending::<()>().await;
-            unreachable!("pending future should never resolve");
+/// Drive the mock processor stream for a given behavior.
+#[allow(clippy::cognitive_complexity, reason = "dispatch over mock behavior variants")]
+async fn drive_mock(
+    behavior: MockBehavior,
+    mut stream: tonic::Streaming<ProcessingRequest>,
+    tx: tokio::sync::mpsc::Sender<Result<ProcessingResponse, tonic::Status>>,
+) {
+    match &behavior {
+        MockBehavior::Hang => futures::future::pending::<()>().await,
+        MockBehavior::Noop => drive_single(&mut stream, &tx, build_noop_response).await,
+        MockBehavior::AddHeader { name, value } => {
+            let (n, v) = (name.clone(), value.clone());
+            drive_single(&mut stream, &tx, move |msg| build_add_header_response(msg, &n, &v)).await;
+        },
+        MockBehavior::ImmediateReject { status, body } => {
+            drop(stream.message().await);
+            drop(tx.send(Ok(build_immediate_response(*status, body))).await);
+        },
+        MockBehavior::UnexpectedBodyResponse => {
+            drop(stream.message().await);
+            drop(tx.send(Ok(build_unexpected_body_response())).await);
+        },
+        MockBehavior::AlwaysResponseHeaders => {
+            drop(stream.message().await);
+            drop(tx.send(Ok(build_always_response_headers())).await);
         },
         MockBehavior::OverrideThenRespond {
             override_ms,
             name,
             value,
-        } => vec![
-            build_override_response(*override_ms),
-            build_add_header_response(msg, name, value),
-        ],
-        MockBehavior::Noop => vec![build_noop_response(msg)],
-        MockBehavior::AddHeader { name, value } => vec![build_add_header_response(msg, name, value)],
-        MockBehavior::ImmediateReject { status, body } => vec![build_immediate_response(*status, body)],
-        MockBehavior::UnexpectedBodyResponse => vec![build_unexpected_body_response()],
-        MockBehavior::AlwaysResponseHeaders => vec![build_always_response_headers()],
+        } => {
+            if let Ok(Some(msg)) = stream.message().await {
+                drop(tx.send(Ok(build_override_response(*override_ms))).await);
+                drop(tx.send(Ok(build_add_header_response(&msg, name, value))).await);
+            }
+        },
+        MockBehavior::EchoBody => drive_loop(&mut stream, &tx, build_echo_body_response).await,
+        MockBehavior::ClearBody => drive_loop(&mut stream, &tx, build_clear_body_response).await,
+        MockBehavior::ImmediateOnBody { status, body } => {
+            drive_immediate_on_body(&mut stream, &tx, *status, body).await;
+        },
+        MockBehavior::FullLifecycle => drive_loop(&mut stream, &tx, build_noop_response).await,
+    }
+}
+
+/// Read one message and respond.
+async fn drive_single(
+    stream: &mut tonic::Streaming<ProcessingRequest>,
+    tx: &tokio::sync::mpsc::Sender<Result<ProcessingResponse, tonic::Status>>,
+    f: impl FnOnce(&ProcessingRequest) -> ProcessingResponse,
+) {
+    if let Ok(Some(msg)) = stream.message().await {
+        drop(tx.send(Ok(f(&msg))).await);
+    }
+}
+
+/// Read messages in a loop and respond to each.
+async fn drive_loop(
+    stream: &mut tonic::Streaming<ProcessingRequest>,
+    tx: &tokio::sync::mpsc::Sender<Result<ProcessingResponse, tonic::Status>>,
+    f: fn(&ProcessingRequest) -> ProcessingResponse,
+) {
+    while let Ok(Some(msg)) = stream.message().await {
+        if tx.send(Ok(f(&msg))).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Respond with noop until a body phase, then return an immediate response.
+async fn drive_immediate_on_body(
+    stream: &mut tonic::Streaming<ProcessingRequest>,
+    tx: &tokio::sync::mpsc::Sender<Result<ProcessingResponse, tonic::Status>>,
+    status: i32,
+    body: &str,
+) {
+    while let Ok(Some(msg)) = stream.message().await {
+        if is_body_phase(&msg) {
+            drop(tx.send(Ok(build_immediate_response(status, body))).await);
+            break;
+        }
+        if tx.send(Ok(build_noop_response(&msg))).await.is_err() {
+            break;
+        }
     }
 }
 
@@ -2003,6 +2593,12 @@ fn build_noop_response(req: &ProcessingRequest) -> ProcessingResponse {
         },
         Some(processing_request::Request::ResponseHeaders(_)) => {
             processing_response::Response::ResponseHeaders(HeadersResponse { response: None })
+        },
+        Some(processing_request::Request::RequestBody(_)) => {
+            processing_response::Response::RequestBody(BodyResponse { response: None })
+        },
+        Some(processing_request::Request::ResponseBody(_)) => {
+            processing_response::Response::ResponseBody(BodyResponse { response: None })
         },
         _ => processing_response::Response::RequestHeaders(HeadersResponse { response: None }),
     };
@@ -2081,6 +2677,79 @@ fn build_always_response_headers() -> ProcessingResponse {
         })),
         ..Default::default()
     }
+}
+
+/// Build a response that echoes body chunks with an "echo:" prefix.
+fn build_echo_body_response(req: &ProcessingRequest) -> ProcessingResponse {
+    use praxis_proto::envoy::service::ext_proc::v3::{BodyMutation, body_mutation};
+
+    let body_bytes = extract_body_bytes(req);
+    match body_bytes {
+        Some(bytes) => {
+            let echoed = format!("echo:{}", String::from_utf8_lossy(bytes));
+            let bm = BodyMutation {
+                mutation: Some(body_mutation::Mutation::Body(echoed.into_bytes())),
+            };
+            wrap_body_mutation(req, Some(bm))
+        },
+        None => build_noop_response(req),
+    }
+}
+
+/// Extract body bytes from a request/response body message.
+fn extract_body_bytes(req: &ProcessingRequest) -> Option<&[u8]> {
+    match &req.request {
+        Some(processing_request::Request::RequestBody(hb) | processing_request::Request::ResponseBody(hb)) => {
+            Some(&hb.body)
+        },
+        _ => None,
+    }
+}
+
+/// Build a response that clears the body via `ClearBody(true)`.
+fn build_clear_body_response(req: &ProcessingRequest) -> ProcessingResponse {
+    use praxis_proto::envoy::service::ext_proc::v3::{BodyMutation, body_mutation};
+
+    let bm = BodyMutation {
+        mutation: Some(body_mutation::Mutation::ClearBody(true)),
+    };
+    if is_body_phase(req) {
+        wrap_body_mutation(req, Some(bm))
+    } else {
+        build_noop_response(req)
+    }
+}
+
+/// Wrap a [`BodyMutation`] into the correct response variant.
+fn wrap_body_mutation(
+    req: &ProcessingRequest,
+    body_mutation: Option<praxis_proto::envoy::service::ext_proc::v3::BodyMutation>,
+) -> ProcessingResponse {
+    let common = Some(CommonResponse {
+        status: 0,
+        header_mutation: None,
+        body_mutation,
+        trailers: None,
+        clear_route_cache: false,
+    });
+    let response = match &req.request {
+        Some(processing_request::Request::ResponseBody(_)) => {
+            processing_response::Response::ResponseBody(BodyResponse { response: common })
+        },
+        _ => processing_response::Response::RequestBody(BodyResponse { response: common }),
+    };
+    ProcessingResponse {
+        response: Some(response),
+        ..Default::default()
+    }
+}
+
+/// Returns `true` if the request is a body phase message.
+fn is_body_phase(req: &ProcessingRequest) -> bool {
+    matches!(
+        &req.request,
+        Some(processing_request::Request::RequestBody(_) | processing_request::Request::ResponseBody(_))
+    )
 }
 
 /// RAII guard that shuts down the mock gRPC server on drop.

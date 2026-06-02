@@ -37,12 +37,24 @@
 
 mod callout;
 mod mutations;
-use std::time::Duration;
+#[cfg(test)]
+mod tests;
+
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use async_trait::async_trait;
-use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
+use bytes::Bytes;
+use dashmap::DashMap;
+use praxis_filter::{
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
+};
 use serde::Deserialize;
 use tonic::transport::{Channel, Endpoint};
+
+use crate::callout::StreamHandle;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -451,14 +463,8 @@ fn validate_processing_mode(pm: ProcessingModeConfig) -> Result<(), FilterError>
     if pm.response_header_mode == HeaderSendMode::Skip {
         return Err("ext_proc: response_header_mode 'skip' is not yet supported".into());
     }
-    if pm.request_body_mode != BodySendMode::None {
-        let mode = pm.request_body_mode;
-        return Err(format!("ext_proc: request_body_mode '{mode}' is not yet supported (only 'none')").into());
-    }
-    if pm.response_body_mode != BodySendMode::None {
-        let mode = pm.response_body_mode;
-        return Err(format!("ext_proc: response_body_mode '{mode}' is not yet supported (only 'none')").into());
-    }
+    validate_body_mode("request_body_mode", pm.request_body_mode)?;
+    validate_body_mode("response_body_mode", pm.response_body_mode)?;
     if pm.request_trailer_mode == HeaderSendMode::Send {
         return Err("ext_proc: request_trailer_mode 'send' is not yet supported".into());
     }
@@ -469,6 +475,20 @@ fn validate_processing_mode(pm: ProcessingModeConfig) -> Result<(), FilterError>
     Ok(())
 }
 
+/// Reject unsupported body send modes.
+///
+/// Accepts `None`, `Streamed`, and `FullDuplexStreamed`. Rejects
+/// `Buffered` and `BufferedPartial` which require full-body
+/// buffering not yet implemented.
+fn validate_body_mode(field: &str, mode: BodySendMode) -> Result<(), FilterError> {
+    match mode {
+        BodySendMode::None | BodySendMode::Streamed | BodySendMode::FullDuplexStreamed => Ok(()),
+        BodySendMode::Buffered | BodySendMode::BufferedPartial => {
+            Err(format!("ext_proc: {field} '{mode}' is not yet supported").into())
+        },
+    }
+}
+
 // -----------------------------------------------------------------------------
 // ExtProcFilter
 // -----------------------------------------------------------------------------
@@ -476,7 +496,9 @@ fn validate_processing_mode(pm: ProcessingModeConfig) -> Result<(), FilterError>
 /// External processing filter using the Envoy `ext_proc` gRPC protocol.
 ///
 /// Validates the target URI and config at construction time (fail-fast)
-/// and builds a lazily-connecting gRPC channel.
+/// and builds a lazily-connecting gRPC channel. Per-request gRPC
+/// streams are stored in a [`DashMap`] keyed by a monotonic stream ID
+/// that is persisted in [`HttpFilterContext::filter_metadata`].
 ///
 /// # YAML configuration
 ///
@@ -491,23 +513,50 @@ fn validate_processing_mode(pm: ProcessingModeConfig) -> Result<(), FilterError>
 ///   request_body_mode: none
 ///   response_body_mode: none
 /// ```
-#[derive(Debug)]
 pub struct ExtProcFilter {
     /// Lazily-connecting gRPC channel to the external processor.
     channel: Channel,
 
+    /// Upper bound for processor-requested timeout overrides.
+    max_message_timeout: Option<Duration>,
+
     /// Per-message timeout for gRPC calls.
     message_timeout: Duration,
 
-    /// Upper bound for processor-requested timeout overrides.
-    max_message_timeout: Option<Duration>,
+    /// Configured processing mode controlling which phases are sent.
+    processing_mode: ProcessingModeConfig,
 
     /// HTTP status code returned on processor errors.
     status_on_error: u16,
 
+    /// Per-request persistent gRPC stream handles.
+    // TODO: add TTL-based eviction for orphaned entries.
+    stream_handles: DashMap<u64, StreamHandle>,
+
     /// gRPC endpoint URI (retained for diagnostics).
     target: String,
+
+    /// Monotonic counter for stream IDs.
+    next_stream_id: AtomicU64,
 }
+
+impl std::fmt::Debug for ExtProcFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtProcFilter")
+            .field("channel", &self.channel)
+            .field("max_message_timeout", &self.max_message_timeout)
+            .field("message_timeout", &self.message_timeout)
+            .field("processing_mode", &self.processing_mode)
+            .field("status_on_error", &self.status_on_error)
+            .field("stream_handles_len", &self.stream_handles.len())
+            .field("target", &self.target)
+            .field("next_stream_id", &self.next_stream_id)
+            .finish()
+    }
+}
+
+/// Metadata key for the per-request stream ID.
+const STREAM_ID_KEY: &str = "ext_proc.stream_id";
 
 impl ExtProcFilter {
     /// Create from parsed YAML config.
@@ -535,8 +584,11 @@ impl ExtProcFilter {
             channel,
             max_message_timeout: cfg.max_message_timeout_ms.map(Duration::from_millis),
             message_timeout: Duration::from_millis(cfg.message_timeout_ms),
+            processing_mode: cfg.processing_mode,
             status_on_error: cfg.status_on_error,
+            stream_handles: DashMap::new(),
             target: cfg.target,
+            next_stream_id: AtomicU64::new(0),
         }))
     }
 
@@ -562,6 +614,16 @@ impl ExtProcFilter {
             },
         }
     }
+
+    /// Retrieve the stream ID stored in filter metadata.
+    fn get_stream_id(ctx: &HttpFilterContext<'_>) -> Result<u64, FilterError> {
+        ctx.get_metadata(STREAM_ID_KEY)
+            .ok_or_else(|| FilterError::from("ext_proc: missing stream_id in filter_metadata"))
+            .and_then(|v| {
+                v.parse::<u64>()
+                    .map_err(|_parse| FilterError::from("ext_proc: invalid stream_id in filter_metadata"))
+            })
+    }
 }
 
 #[async_trait]
@@ -570,32 +632,132 @@ impl HttpFilter for ExtProcFilter {
         "ext_proc"
     }
 
+    fn request_body_access(&self) -> BodyAccess {
+        if self.processing_mode.request_body_mode == BodySendMode::None {
+            BodyAccess::None
+        } else {
+            BodyAccess::ReadWrite
+        }
+    }
+
+    fn response_body_access(&self) -> BodyAccess {
+        if self.processing_mode.response_body_mode == BodySendMode::None {
+            BodyAccess::None
+        } else {
+            BodyAccess::ReadWrite
+        }
+    }
+
+    fn request_body_mode(&self) -> BodyMode {
+        BodyMode::Stream
+    }
+
+    fn response_body_mode(&self) -> BodyMode {
+        BodyMode::Stream
+    }
+
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        Ok(self.call_or_reject(
-            callout::process_request_headers(
-                self.channel.clone(),
-                &self.target,
-                self.message_timeout,
-                self.max_message_timeout,
-                ctx,
-            )
-            .await,
-        ))
+        let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
+        ctx.set_metadata(STREAM_ID_KEY, stream_id.to_string());
+
+        let handle = callout::open_stream(self.channel.clone(), self.target.clone());
+
+        let action = callout::process_request_headers(
+            &handle,
+            &self.target,
+            self.message_timeout,
+            self.max_message_timeout,
+            ctx,
+        )
+        .await;
+
+        self.stream_handles.insert(stream_id, handle);
+
+        Ok(self.call_or_reject(action))
+    }
+
+    async fn on_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        let stream_id = Self::get_stream_id(ctx)?;
+
+        let handle = self
+            .stream_handles
+            .get(&stream_id)
+            .ok_or_else(|| FilterError::from("ext_proc: stream handle not found for request body"))?;
+
+        let action = callout::process_request_body(
+            &handle,
+            &self.target,
+            self.message_timeout,
+            self.max_message_timeout,
+            ctx,
+            body,
+            end_of_stream,
+        )
+        .await;
+
+        drop(handle);
+
+        if end_of_stream && self.processing_mode.response_body_mode == BodySendMode::None {
+            self.stream_handles.remove(&stream_id);
+        }
+
+        Ok(self.call_or_reject(action))
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        Ok(self.call_or_reject(
-            callout::process_response_headers(
-                self.channel.clone(),
-                &self.target,
-                self.message_timeout,
-                self.max_message_timeout,
-                ctx,
-            )
-            .await,
-        ))
+        let stream_id = Self::get_stream_id(ctx)?;
+
+        let handle = self
+            .stream_handles
+            .get(&stream_id)
+            .ok_or_else(|| FilterError::from("ext_proc: stream handle not found for response headers"))?;
+
+        let action = callout::process_response_headers(
+            &handle,
+            &self.target,
+            self.message_timeout,
+            self.max_message_timeout,
+            ctx,
+        )
+        .await;
+
+        Ok(self.call_or_reject(action))
+    }
+
+    fn on_response_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        let stream_id = Self::get_stream_id(ctx)?;
+
+        let handle = self
+            .stream_handles
+            .get(&stream_id)
+            .ok_or_else(|| FilterError::from("ext_proc: stream handle not found for response body"))?;
+
+        let action = callout::process_response_body(
+            &handle,
+            &self.target,
+            self.message_timeout,
+            self.max_message_timeout,
+            ctx,
+            body,
+            end_of_stream,
+        );
+
+        drop(handle);
+
+        if end_of_stream {
+            self.stream_handles.remove(&stream_id);
+        }
+
+        Ok(self.call_or_reject(action))
     }
 }
-
-#[cfg(test)]
-mod tests;

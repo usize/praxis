@@ -1,24 +1,30 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Praxis Contributors
 
-//! Proto-to-Praxis conversions for `ext_proc` header mutations.
+//! Proto-to-Praxis conversions for `ext_proc` header and body mutations.
 //!
 //! Translates between the Envoy `ext_proc` protobuf types and
-//! Praxis filter context operations: building [`HttpHeaders`]
-//! from request/response state and applying [`HeaderMutation`]
-//! and [`ImmediateResponse`] results back to the context.
+//! Praxis filter context operations: building [`HttpHeaders`] and
+//! [`HttpBody`] from request/response state and applying
+//! [`HeaderMutation`], [`BodyMutation`], and [`ImmediateResponse`]
+//! results back to the context.
 //!
 //! [`HttpHeaders`]: praxis_proto::envoy::service::ext_proc::v3::HttpHeaders
+//! [`HttpBody`]: praxis_proto::envoy::service::ext_proc::v3::HttpBody
 //! [`HeaderMutation`]: praxis_proto::envoy::service::ext_proc::v3::HeaderMutation
+//! [`BodyMutation`]: praxis_proto::envoy::service::ext_proc::v3::BodyMutation
 //! [`ImmediateResponse`]: praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse
 
 use std::borrow::Cow;
 
 use bytes::Bytes;
-use praxis_filter::{FilterAction, HttpFilterContext, Rejection};
+use praxis_filter::{FilterAction, FilterError, HttpFilterContext, Rejection};
 use praxis_proto::envoy::service::{
     common::v3::{HeaderValue, HeaderValueOption},
-    ext_proc::v3::{HeaderMutation, HeadersResponse, HttpHeaders, ImmediateResponse},
+    ext_proc::v3::{
+        BodyResponse, HeaderMutation, HeadersResponse, HttpBody, HttpHeaders, ImmediateResponse, ProcessingRequest,
+        body_mutation, processing_request,
+    },
 };
 
 use crate::Phase;
@@ -88,6 +94,40 @@ pub(crate) fn response_to_proto_headers(ctx: &HttpFilterContext<'_>) -> HttpHead
     HttpHeaders {
         headers: Some(praxis_proto::envoy::service::ext_proc::v3::HeaderMap { headers }),
         end_of_stream: false,
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Body → Proto
+// -----------------------------------------------------------------------------
+
+/// Build a [`ProcessingRequest`] wrapping a request body chunk.
+///
+/// Sends the body bytes (or empty if `None`) with the
+/// `end_of_stream` flag.
+pub(crate) fn request_body_to_request(body: &Option<Bytes>, end_of_stream: bool) -> ProcessingRequest {
+    let http_body = HttpBody {
+        body: body.as_ref().map_or_else(Vec::new, |b| b.to_vec()),
+        end_of_stream,
+    };
+    ProcessingRequest {
+        request: Some(processing_request::Request::RequestBody(http_body)),
+        ..Default::default()
+    }
+}
+
+/// Build a [`ProcessingRequest`] wrapping a response body chunk.
+///
+/// Sends the body bytes (or empty if `None`) with the
+/// `end_of_stream` flag.
+pub(crate) fn response_body_to_request(body: &Option<Bytes>, end_of_stream: bool) -> ProcessingRequest {
+    let http_body = HttpBody {
+        body: body.as_ref().map_or_else(Vec::new, |b| b.to_vec()),
+        end_of_stream,
+    };
+    ProcessingRequest {
+        request: Some(processing_request::Request::ResponseBody(http_body)),
+        ..Default::default()
     }
 }
 
@@ -249,6 +289,71 @@ fn remove_response_headers(names: &[String], resp: &mut praxis_filter::Response)
         }
     }
     modified
+}
+
+/// Apply a [`BodyResponse`] to the filter context and body buffer.
+///
+/// Handles three mutation variants:
+/// - [`body_mutation::Mutation::StreamedResponse`] — replaces body bytes with the streamed chunk (used in
+///   `FULL_DUPLEX_STREAMED`).
+/// - [`body_mutation::Mutation::Body`] — replaces body bytes (used in `STREAMED` mode).
+/// - [`body_mutation::Mutation::ClearBody`] — clears the body chunk.
+///
+/// Also applies any header mutations from the [`CommonResponse`].
+///
+/// [`CommonResponse`]: praxis_proto::envoy::service::ext_proc::v3::CommonResponse
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "Result matches dispatch_body_response call-site contract"
+)]
+pub(crate) fn apply_body_response(
+    br: &BodyResponse,
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    phase: Phase,
+) -> Result<FilterAction, FilterError> {
+    let Some(common) = &br.response else {
+        return Ok(FilterAction::Continue);
+    };
+
+    if let Some(mutation) = &common.header_mutation {
+        match phase {
+            Phase::Request => apply_request_header_mutation(mutation, ctx),
+            Phase::Response => apply_response_header_mutation(mutation, ctx),
+        }
+    }
+
+    if let Some(body_mutation) = &common.body_mutation {
+        apply_body_mutation(body_mutation, body);
+    }
+
+    Ok(FilterAction::Continue)
+}
+
+/// Apply a [`BodyMutation`] to the body buffer.
+///
+/// [`BodyMutation`]: praxis_proto::envoy::service::ext_proc::v3::BodyMutation
+fn apply_body_mutation(bm: &praxis_proto::envoy::service::ext_proc::v3::BodyMutation, body: &mut Option<Bytes>) {
+    let Some(mutation) = &bm.mutation else {
+        return;
+    };
+
+    match mutation {
+        body_mutation::Mutation::Body(new_body) => {
+            *body = Some(Bytes::copy_from_slice(new_body));
+        },
+        body_mutation::Mutation::ClearBody(true) => {
+            *body = None;
+        },
+        body_mutation::Mutation::ClearBody(false) => {},
+        body_mutation::Mutation::StreamedResponse(streamed) => {
+            if streamed.body.is_empty() {
+                *body = None;
+            } else {
+                *body = Some(Bytes::copy_from_slice(&streamed.body));
+            }
+        },
+    }
 }
 
 /// Convert an [`ImmediateResponse`] to a [`FilterAction::Reject`].
