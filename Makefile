@@ -42,6 +42,7 @@ endif
 	test test-unit \
 	test-schema test-integration test-conformance \
 	test-security test-security-suite test-resilience test-smoke \
+	test-ext-proc \
 	bench \
 	lint fmt doc audit coverage coverage-check \
 	fuzz fuzz-build \
@@ -130,6 +131,13 @@ test-container: | require-container-engine
 test-container-run: test-container
 	$(CONTAINER_ENGINE) run --rm -v $(CURDIR):/src -v praxis-test-cache:/cache \
 		$(IMAGE)-test:$(VERSION) 2>&1
+
+# -------------------------------------------------------------------
+# Test ext-proc (container-based)
+# -------------------------------------------------------------------
+
+test-ext-proc: | require-container-engine
+	tests/ext-proc-mock/test.sh
 
 # -------------------------------------------------------------------
 # Test
@@ -361,6 +369,7 @@ help:
 	@echo "  test-config-validation  alias for test-schema"
 	@echo "  test-config          alias for test-schema"
 	@echo "  test-smoke           smoke tests only"
+	@echo "  test-ext-proc        ext-proc live integration test (containers)"
 	@echo ""
 	@echo "Bench:"
 	@echo "  bench                Criterion micro-benchmarks"

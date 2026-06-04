@@ -15,8 +15,12 @@
 //!
 //! # Registration
 //!
-//! This filter is not included in [`FilterRegistry::with_builtins`].
-//! Register it explicitly:
+//! When the `ext-proc` feature is enabled on the `praxis` binary
+//! crate (`cargo build -p praxis --features ext-proc`), this filter
+//! is automatically registered under the name `"ext_proc"` at server
+//! startup.
+//!
+//! For manual registration in custom binaries:
 //!
 //! ```ignore
 //! use praxis_filter::FilterRegistry;
@@ -41,7 +45,10 @@ mod mutations;
 mod tests;
 
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -514,8 +521,15 @@ fn validate_body_mode(field: &str, mode: BodySendMode) -> Result<(), FilterError
 ///   response_body_mode: none
 /// ```
 pub struct ExtProcFilter {
-    /// Lazily-connecting gRPC channel to the external processor.
-    channel: Channel,
+    /// gRPC endpoint parsed at construction time. The actual
+    /// [`Channel`] is created lazily on first use so that
+    /// construction does not require a Tokio runtime context.
+    endpoint: Endpoint,
+
+    /// Lazily-initialized gRPC channel. Populated on the first
+    /// call to [`Self::channel`], which runs inside the Tokio
+    /// runtime during request processing.
+    channel: OnceLock<Channel>,
 
     /// Upper bound for processor-requested timeout overrides.
     max_message_timeout: Option<Duration>,
@@ -543,7 +557,8 @@ pub struct ExtProcFilter {
 impl std::fmt::Debug for ExtProcFilter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExtProcFilter")
-            .field("channel", &self.channel)
+            .field("endpoint", &self.endpoint)
+            .field("channel_initialized", &self.channel.get().is_some())
             .field("max_message_timeout", &self.max_message_timeout)
             .field("message_timeout", &self.message_timeout)
             .field("processing_mode", &self.processing_mode)
@@ -578,10 +593,9 @@ impl ExtProcFilter {
             format!("ext_proc: invalid target URI '{target}': {e}").into()
         })?;
 
-        let channel = endpoint.connect_lazy();
-
         Ok(Box::new(Self {
-            channel,
+            endpoint,
+            channel: OnceLock::new(),
             max_message_timeout: cfg.max_message_timeout_ms.map(Duration::from_millis),
             message_timeout: Duration::from_millis(cfg.message_timeout_ms),
             processing_mode: cfg.processing_mode,
@@ -590,6 +604,15 @@ impl ExtProcFilter {
             target: cfg.target,
             next_stream_id: AtomicU64::new(0),
         }))
+    }
+
+    /// Returns the lazily-initialized gRPC channel.
+    ///
+    /// The channel is created on first call via [`Endpoint::connect_lazy`],
+    /// which requires a Tokio runtime context. Subsequent calls return the
+    /// cached channel.
+    fn channel(&self) -> Channel {
+        self.channel.get_or_init(|| self.endpoint.connect_lazy()).clone()
     }
 
     /// Convert a callout error into a rejection with [`status_on_error`].
@@ -660,7 +683,7 @@ impl HttpFilter for ExtProcFilter {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         ctx.set_metadata(STREAM_ID_KEY, stream_id.to_string());
 
-        let handle = callout::open_stream(self.channel.clone(), self.target.clone());
+        let handle = callout::open_stream(self.channel(), self.target.clone());
 
         let action = callout::process_request_headers(
             &handle,
@@ -725,6 +748,8 @@ impl HttpFilter for ExtProcFilter {
             ctx,
         )
         .await;
+
+        drop(handle);
 
         Ok(self.call_or_reject(action))
     }

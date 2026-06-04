@@ -1,0 +1,82 @@
+# syntax=docker/dockerfile:1
+
+# ------------------------------------------------------------------------------
+# Stage 1: Build
+# ------------------------------------------------------------------------------
+
+FROM rust:1.94-alpine AS builder
+
+RUN apk add --no-cache musl-dev pkgconf cmake make g++
+
+WORKDIR /src
+
+# Copy workspace manifests for dependency caching.
+COPY Cargo.toml Cargo.lock ./
+COPY filter/proto/Cargo.toml filter/proto/Cargo.toml
+COPY tests/ext-proc-mock/Cargo.toml tests/ext-proc-mock/Cargo.toml
+
+# The proto crate needs its build.rs and .proto files.
+COPY filter/proto/build.rs filter/proto/build.rs
+COPY filter/proto/proto filter/proto/proto
+
+# Strip workspace members to only those needed for the mock binary.
+# Keep filter/proto and tests/ext-proc-mock; delete everything else.
+RUN sed -i \
+    -e '/"server"/d' \
+    -e '/"core"/d' \
+    -e '/"filter",/d' \
+    -e '/"filter\/ext-proc"/d' \
+    -e '/"protocol"/d' \
+    -e '/"tls"/d' \
+    -e '/"benchmarks"/d' \
+    -e '/"xtask"/d' \
+    -e '/tests\/schema/d' \
+    -e '/tests\/conformance/d' \
+    -e '/tests\/integration/d' \
+    -e '/tests\/resilience/d' \
+    -e '/tests\/security/d' \
+    -e '/tests\/smoke/d' \
+    -e '/tests\/utils/d' \
+    -e '/^exclude/d' \
+    -e '/# Praxis/d' \
+    Cargo.toml
+
+# Create stub sources for dependency caching.
+RUN mkdir -p filter/proto/src tests/ext-proc-mock/src \
+    && echo '//! stub' > filter/proto/src/lib.rs \
+    && printf '//! stub\nfn main() {}\n' > tests/ext-proc-mock/src/main.rs
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p praxis-ext-proc-mock
+
+# Replace stubs with real source.
+COPY filter/proto/src filter/proto/src
+COPY tests/ext-proc-mock/src tests/ext-proc-mock/src
+
+RUN find filter/proto/src tests/ext-proc-mock/src \
+    -name '*.rs' -exec touch {} +
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p praxis-ext-proc-mock \
+    && cp target/release/praxis-ext-proc-mock /usr/local/bin/praxis-ext-proc-mock
+
+# ------------------------------------------------------------------------------
+# Stage 2: Runtime
+# ------------------------------------------------------------------------------
+
+FROM alpine:3.23
+
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S epp \
+    && adduser -S -G epp -h /nonexistent -s /sbin/nologin epp
+
+COPY --from=builder --chown=root:root --chmod=0555 \
+    /usr/local/bin/praxis-ext-proc-mock /usr/local/bin/praxis-ext-proc-mock
+
+USER epp:epp
+
+EXPOSE 50051
+
+ENTRYPOINT ["praxis-ext-proc-mock"]

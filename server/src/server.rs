@@ -52,6 +52,9 @@ pub fn resolve_config_path(explicit: Option<&str>) -> Option<PathBuf> {
 
 /// Build filter pipelines using the built-in registry, register protocols and run the server.
 ///
+/// When compiled with `--features ext-proc`, the `ext_proc` filter is
+/// automatically registered alongside the other built-ins.
+///
 /// # Security: Root Check
 ///
 /// On Unix, this function refuses to start if the effective UID is 0 (root). Set
@@ -61,8 +64,26 @@ pub fn resolve_config_path(explicit: Option<&str>) -> Option<PathBuf> {
 /// Config is owned for the server's lifetime (never returns).
 #[allow(clippy::needless_pass_by_value, reason = "server owns config")]
 pub fn run_server(config: Config, config_path: Option<PathBuf>) -> ! {
-    run_server_with_registry(config, FilterRegistry::with_builtins(), config_path)
+    let mut registry = FilterRegistry::with_builtins();
+    register_optional_filters(&mut registry);
+    run_server_with_registry(config, registry, config_path)
 }
+
+/// Register filters that are gated behind optional feature flags.
+#[cfg(feature = "ext-proc")]
+fn register_optional_filters(registry: &mut FilterRegistry) {
+    registry
+        .register(
+            "ext_proc",
+            praxis_filter::http_builtin(praxis_ext_proc::ExtProcFilter::from_config),
+        )
+        .unwrap_or_else(|e| fatal(&e));
+}
+
+/// No-op when no optional filter features are enabled.
+#[cfg(not(feature = "ext-proc"))]
+fn register_optional_filters(_registry: &mut FilterRegistry) {}
+
 
 /// Build filter pipelines from the given registry, register protocols and run the server.
 ///

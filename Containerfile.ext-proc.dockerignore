@@ -1,0 +1,12 @@
+# Build context for ext-proc-enabled praxis image.
+target/
+.*
+docs/
+*.md
+LICENSE*
+rustfmt.toml
+deny.toml
+Makefile
+tests/
+xtask/
+benchmarks/

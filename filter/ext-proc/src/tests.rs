@@ -2314,8 +2314,11 @@ fn assert_continue(result: Result<FilterAction, FilterError>, phase: &str) {
 
 /// Build an [`ExtProcFilter`] with streamed body modes for integration tests.
 fn make_body_filter(channel: Channel, addr: SocketAddr) -> ExtProcFilter {
+    let target = format!("http://{addr}");
+    let endpoint: Endpoint = target.parse().expect("valid endpoint");
     ExtProcFilter {
-        channel,
+        endpoint,
+        channel: OnceLock::from(channel),
         max_message_timeout: None,
         message_timeout: Duration::from_secs(5),
         processing_mode: ProcessingModeConfig {
@@ -2325,7 +2328,7 @@ fn make_body_filter(channel: Channel, addr: SocketAddr) -> ExtProcFilter {
         },
         status_on_error: 500,
         stream_handles: DashMap::new(),
-        target: format!("http://{addr}"),
+        target,
         next_stream_id: AtomicU64::new(0),
     }
 }
@@ -2512,6 +2515,22 @@ async fn drive_mock(
             let (n, v) = (name.clone(), value.clone());
             drive_single(&mut stream, &tx, move |msg| build_add_header_response(msg, &n, &v)).await;
         },
+        MockBehavior::EchoBody => drive_loop(&mut stream, &tx, build_echo_body_response).await,
+        MockBehavior::ClearBody => drive_loop(&mut stream, &tx, build_clear_body_response).await,
+        MockBehavior::FullLifecycle => drive_loop(&mut stream, &tx, build_noop_response).await,
+        _ => drive_one_shot(&behavior, &mut stream, &tx).await,
+    }
+}
+
+/// Dispatch single-message mock behaviors that read one request and
+/// send a fixed response.
+#[allow(clippy::cognitive_complexity, reason = "flat match arms, not genuinely complex")]
+async fn drive_one_shot(
+    behavior: &MockBehavior,
+    stream: &mut tonic::Streaming<ProcessingRequest>,
+    tx: &tokio::sync::mpsc::Sender<Result<ProcessingResponse, tonic::Status>>,
+) {
+    match behavior {
         MockBehavior::ImmediateReject { status, body } => {
             drop(stream.message().await);
             drop(tx.send(Ok(build_immediate_response(*status, body))).await);
@@ -2534,12 +2553,10 @@ async fn drive_mock(
                 drop(tx.send(Ok(build_add_header_response(&msg, name, value))).await);
             }
         },
-        MockBehavior::EchoBody => drive_loop(&mut stream, &tx, build_echo_body_response).await,
-        MockBehavior::ClearBody => drive_loop(&mut stream, &tx, build_clear_body_response).await,
         MockBehavior::ImmediateOnBody { status, body } => {
-            drive_immediate_on_body(&mut stream, &tx, *status, body).await;
+            drive_immediate_on_body(stream, tx, *status, body).await;
         },
-        MockBehavior::FullLifecycle => drive_loop(&mut stream, &tx, build_noop_response).await,
+        _ => {},
     }
 }
 

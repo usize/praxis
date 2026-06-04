@@ -2258,6 +2258,7 @@ dependencies = [
  "nix 0.31.3",
  "notify",
  "praxis-proxy-core",
+ "praxis-proxy-ext-proc",
  "praxis-proxy-filter",
  "praxis-proxy-protocol",
  "serde",
@@ -2267,6 +2268,20 @@ dependencies = [
  "tokio-util",
  "tracing",
  "yaml_serde",
+]
+
+[[package]]
+name = "praxis-ext-proc-mock"
+version = "0.3.1"
+dependencies = [
+ "clap",
+ "praxis-proxy-proto",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

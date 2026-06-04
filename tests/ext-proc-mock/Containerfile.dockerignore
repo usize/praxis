@@ -1,0 +1,18 @@
+# Build context for mock EPP: only proto + mock source needed.
+target/
+.*
+docs/
+*.md
+LICENSE*
+rustfmt.toml
+deny.toml
+Makefile
+xtask/
+benchmarks/
+examples/
+server/
+core/
+protocol/
+tls/
+filter/src/
+filter/ext-proc/

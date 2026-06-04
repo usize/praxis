@@ -1,0 +1,29 @@
+[package]
+name = "praxis-ext-proc-mock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Mock EPP (Endpoint Picker) service for ext_proc integration tests"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "praxis-ext-proc-mock"
+path = "src/main.rs"
+
+# Workspace lints are not inherited: this is a test-only binary
+# that cannot satisfy all strict style rules.
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+clap = { workspace = true }
+praxis-proto = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio-stream = "0.1"
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

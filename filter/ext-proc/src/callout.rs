@@ -193,8 +193,11 @@ pub(crate) async fn send_and_receive_async(
 
         let mut rx = handle.receiver.lock().await;
         let resp = rx.recv().await.ok_or(CalloutError::EmptyStream)?;
+        let result = receive_with_override(&mut rx, resp, max_timeout, target).await;
 
-        receive_with_override(&mut rx, resp, max_timeout, target).await
+        drop(rx);
+
+        result
     })
     .await;
 
@@ -226,7 +229,13 @@ pub(crate) fn send_and_receive_blocking(
     target: &str,
 ) -> Result<ProcessingResponse, FilterError> {
     tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(send_and_receive_async(handle, request, timeout, max_timeout, target))
+        tokio::runtime::Handle::current().block_on(send_and_receive_async(
+            handle,
+            request,
+            timeout,
+            max_timeout,
+            target,
+        ))
     })
 }
 

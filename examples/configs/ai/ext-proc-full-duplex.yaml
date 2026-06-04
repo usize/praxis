@@ -1,0 +1,58 @@
+# ext_proc Full-Duplex Streaming
+#
+# Demonstrates the ext_proc filter with full-duplex streamed body
+# processing, simulating an llm-d Endpoint Picker (EPP) that
+# inspects request headers and body to set routing decisions.
+#
+# The external processor receives request and response data on a
+# persistent bidirectional gRPC stream, adds routing headers
+# (x-selected-endpoint, x-epp-decision, x-session-token), and
+# streams body chunks through.
+#
+# Requires an ext_proc gRPC server on port 50051. For testing,
+# use the mock EPP service:
+#
+#   cargo run -p praxis-ext-proc-mock -- --port 50051
+#
+# Then start the proxy:
+#
+#   cargo run -p praxis --features ext-proc -- \
+#     -c examples/configs/ai/ext-proc-full-duplex.yaml
+#
+# Example requests:
+#
+#   # Simple GET — response includes x-epp-served-by header
+#   curl http://localhost:8080/
+#
+#   # POST with model info — EPP adds routing headers
+#   curl -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -H "x-model-name: llama3" \
+#     -d '{"model":"llama3","prompt":"hello"}'
+
+listeners:
+  - name: ext-proc-gateway
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - ext-proc-pipeline
+
+filter_chains:
+  - name: ext-proc-pipeline
+    filters:
+      - filter: ext_proc
+        target: "http://127.0.0.1:50051"
+        message_timeout_ms: 1000
+        processing_mode:
+          request_header_mode: send
+          response_header_mode: send
+          request_body_mode: full_duplex_streamed
+          response_body_mode: full_duplex_streamed
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
