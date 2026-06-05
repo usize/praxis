@@ -31,5 +31,6 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+prost-types = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
 tokio-stream = { workspace = true }

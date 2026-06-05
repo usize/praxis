@@ -1559,7 +1559,7 @@ async fn grpc_request_headers_round_trip_applies_mutation() {
     let mut ctx = make_ctx(&req);
     let timeout = Duration::from_secs(5);
 
-    let action = callout::process_request_headers(channel, &addr.to_string(), timeout, &mut ctx)
+    let action = callout::process_request_headers(channel, &addr.to_string(), timeout, None, &mut ctx)
         .await
         .expect("callout should succeed");
 
@@ -1592,7 +1592,7 @@ async fn grpc_response_headers_round_trip_applies_mutation() {
     ctx.response_header = Some(&mut resp);
     let timeout = Duration::from_secs(5);
 
-    let action = callout::process_response_headers(channel, &addr.to_string(), timeout, &mut ctx)
+    let action = callout::process_response_headers(channel, &addr.to_string(), timeout, None, &mut ctx)
         .await
         .expect("callout should succeed");
 
@@ -1623,7 +1623,7 @@ async fn grpc_immediate_response_returns_rejection() {
     let mut ctx = make_ctx(&req);
     let timeout = Duration::from_secs(5);
 
-    let action = callout::process_request_headers(channel, &addr.to_string(), timeout, &mut ctx)
+    let action = callout::process_request_headers(channel, &addr.to_string(), timeout, None, &mut ctx)
         .await
         .expect("callout should succeed");
 
@@ -1649,7 +1649,7 @@ async fn grpc_noop_response_returns_continue() {
     let mut ctx = make_ctx(&req);
     let timeout = Duration::from_secs(5);
 
-    let action = callout::process_request_headers(channel, &addr.to_string(), timeout, &mut ctx)
+    let action = callout::process_request_headers(channel, &addr.to_string(), timeout, None, &mut ctx)
         .await
         .expect("callout should succeed");
 
@@ -1673,7 +1673,7 @@ async fn grpc_unexpected_response_type_returns_error() {
     let mut ctx = make_ctx(&req);
     let timeout = Duration::from_secs(5);
 
-    let result = callout::process_request_headers(channel, &addr.to_string(), timeout, &mut ctx).await;
+    let result = callout::process_request_headers(channel, &addr.to_string(), timeout, None, &mut ctx).await;
 
     assert!(result.is_err(), "unexpected response type should return Err");
     let err = result.unwrap_err().to_string();
@@ -1694,7 +1694,7 @@ async fn grpc_phase_mismatched_response_returns_error() {
     let mut ctx = make_ctx(&req);
     let timeout = Duration::from_secs(5);
 
-    let result = callout::process_request_headers(channel, &addr.to_string(), timeout, &mut ctx).await;
+    let result = callout::process_request_headers(channel, &addr.to_string(), timeout, None, &mut ctx).await;
 
     assert!(result.is_err(), "phase-mismatched response should return Err");
     let err = result.unwrap_err().to_string();
@@ -1714,11 +1714,71 @@ async fn grpc_timeout_returns_error() {
     let mut ctx = make_ctx(&req);
     let timeout = Duration::from_millis(50);
 
-    let result = callout::process_request_headers(channel, &addr.to_string(), timeout, &mut ctx).await;
+    let result = callout::process_request_headers(channel, &addr.to_string(), timeout, None, &mut ctx).await;
 
     assert!(result.is_err(), "timed-out callout should return Err");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("timeout"), "error should mention timeout: {err}");
+}
+
+#[tokio::test]
+async fn grpc_override_timeout_extends_deadline() {
+    let (addr, _guard) = start_mock_processor(MockBehavior::OverrideThenRespond {
+        override_ms: 500,
+        name: "x-after-override".to_owned(),
+        value: "extended".to_owned(),
+    })
+    .await;
+
+    let channel = connect_channel(addr).await;
+
+    let req = make_request(Method::GET, "/");
+    let mut ctx = make_ctx(&req);
+    let timeout = Duration::from_secs(5);
+    let max_timeout = Some(Duration::from_secs(10));
+
+    let action = callout::process_request_headers(channel, &addr.to_string(), timeout, max_timeout, &mut ctx)
+        .await
+        .expect("callout with override should succeed");
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "action should be Continue after override + mutation"
+    );
+    let injected = ctx.extra_request_headers.iter().find(|(k, _)| k == "x-after-override");
+    assert!(
+        injected.is_some(),
+        "header from post-override response should be present"
+    );
+}
+
+#[tokio::test]
+async fn grpc_override_ignored_without_max_timeout() {
+    let (addr, _guard) = start_mock_processor(MockBehavior::OverrideThenRespond {
+        override_ms: 500,
+        name: "x-ignored".to_owned(),
+        value: "value".to_owned(),
+    })
+    .await;
+
+    let channel = connect_channel(addr).await;
+
+    let req = make_request(Method::GET, "/");
+    let mut ctx = make_ctx(&req);
+    let timeout = Duration::from_secs(5);
+
+    let action = callout::process_request_headers(channel, &addr.to_string(), timeout, None, &mut ctx)
+        .await
+        .expect("callout should succeed");
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "override without max_timeout should return Continue (no-op)"
+    );
+    assert!(
+        ctx.extra_request_headers.is_empty(),
+        "no headers should be added when override is ignored"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -1848,6 +1908,13 @@ enum MockBehavior {
 
     /// Return `ResponseHeaders` regardless of request phase.
     AlwaysResponseHeaders,
+
+    /// Send an `override_message_timeout` first, then the real response.
+    OverrideThenRespond {
+        override_ms: u64,
+        name: String,
+        value: String,
+    },
 }
 
 /// Mock implementation of the Envoy `ExternalProcessor` gRPC service.
@@ -1869,20 +1936,32 @@ impl ExternalProcessor for MockProcessor {
             .await?
             .ok_or_else(|| tonic::Status::internal("empty request stream"))?;
 
-        let response = match &self.behavior {
-            MockBehavior::Hang => {
-                futures::future::pending::<()>().await;
-                unreachable!("pending future should never resolve");
-            },
-            MockBehavior::Noop => build_noop_response(&msg),
-            MockBehavior::AddHeader { name, value } => build_add_header_response(&msg, name, value),
-            MockBehavior::ImmediateReject { status, body } => build_immediate_response(*status, body),
-            MockBehavior::UnexpectedBodyResponse => build_unexpected_body_response(),
-            MockBehavior::AlwaysResponseHeaders => build_always_response_headers(),
-        };
-
-        let output = futures::stream::once(async { Ok(response) });
+        let responses = build_mock_responses(&self.behavior, &msg).await;
+        let output = futures::stream::iter(responses.into_iter().map(Ok));
         Ok(tonic::Response::new(Box::pin(output)))
+    }
+}
+
+/// Dispatch mock behavior to response builder(s).
+async fn build_mock_responses(behavior: &MockBehavior, msg: &ProcessingRequest) -> Vec<ProcessingResponse> {
+    match behavior {
+        MockBehavior::Hang => {
+            futures::future::pending::<()>().await;
+            unreachable!("pending future should never resolve");
+        },
+        MockBehavior::OverrideThenRespond {
+            override_ms,
+            name,
+            value,
+        } => vec![
+            build_override_response(*override_ms),
+            build_add_header_response(msg, name, value),
+        ],
+        MockBehavior::Noop => vec![build_noop_response(msg)],
+        MockBehavior::AddHeader { name, value } => vec![build_add_header_response(msg, name, value)],
+        MockBehavior::ImmediateReject { status, body } => vec![build_immediate_response(*status, body)],
+        MockBehavior::UnexpectedBodyResponse => vec![build_unexpected_body_response()],
+        MockBehavior::AlwaysResponseHeaders => vec![build_always_response_headers()],
     }
 }
 
@@ -1938,6 +2017,18 @@ fn build_immediate_response(status: i32, body: &str) -> ProcessingResponse {
             grpc_status: None,
             details: String::new(),
         })),
+        ..Default::default()
+    }
+}
+
+/// Build a response with only `override_message_timeout` and no `response` oneof.
+fn build_override_response(override_ms: u64) -> ProcessingResponse {
+    ProcessingResponse {
+        response: None,
+        override_message_timeout: Some(prost_types::Duration {
+            seconds: i64::try_from(override_ms / 1000).unwrap_or(0),
+            nanos: i32::try_from((override_ms % 1000) * 1_000_000).unwrap_or(0),
+        }),
         ..Default::default()
     }
 }

@@ -164,7 +164,6 @@ struct ExtProcConfig {
     /// Upper bound in milliseconds for `override_message_timeout`
     /// values sent by the external processor. When set, the server
     /// may extend the per-message timeout up to this limit.
-    #[allow(dead_code, reason = "parsed for config compatibility; used in subsequent PRs")]
     max_message_timeout_ms: Option<u64>,
 
     /// Per-message timeout in milliseconds.
@@ -500,6 +499,9 @@ pub struct ExtProcFilter {
     /// Per-message timeout for gRPC calls.
     message_timeout: Duration,
 
+    /// Upper bound for processor-requested timeout overrides.
+    max_message_timeout: Option<Duration>,
+
     /// HTTP status code returned on processor errors.
     #[allow(dead_code, reason = "used by status-on-error rejection in subsequent PRs")]
     status_on_error: u16,
@@ -532,6 +534,7 @@ impl ExtProcFilter {
 
         Ok(Box::new(Self {
             channel,
+            max_message_timeout: cfg.max_message_timeout_ms.map(Duration::from_millis),
             message_timeout: Duration::from_millis(cfg.message_timeout_ms),
             status_on_error: cfg.status_on_error,
             target: cfg.target,
@@ -546,11 +549,25 @@ impl HttpFilter for ExtProcFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        callout::process_request_headers(self.channel.clone(), &self.target, self.message_timeout, ctx).await
+        callout::process_request_headers(
+            self.channel.clone(),
+            &self.target,
+            self.message_timeout,
+            self.max_message_timeout,
+            ctx,
+        )
+        .await
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        callout::process_response_headers(self.channel.clone(), &self.target, self.message_timeout, ctx).await
+        callout::process_response_headers(
+            self.channel.clone(),
+            &self.target,
+            self.message_timeout,
+            self.max_message_timeout,
+            ctx,
+        )
+        .await
     }
 }
 
