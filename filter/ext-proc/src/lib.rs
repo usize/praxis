@@ -40,7 +40,7 @@ mod mutations;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config};
+use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
 use serde::Deserialize;
 use tonic::transport::{Channel, Endpoint};
 
@@ -503,7 +503,6 @@ pub struct ExtProcFilter {
     max_message_timeout: Option<Duration>,
 
     /// HTTP status code returned on processor errors.
-    #[allow(dead_code, reason = "used by status-on-error rejection in subsequent PRs")]
     status_on_error: u16,
 
     /// gRPC endpoint URI (retained for diagnostics).
@@ -540,6 +539,29 @@ impl ExtProcFilter {
             target: cfg.target,
         }))
     }
+
+    /// Convert a callout error into a rejection with [`status_on_error`].
+    ///
+    /// On success the action passes through unchanged. On error the
+    /// processor failure is logged and a [`FilterAction::Reject`] is
+    /// returned with the configured status code, matching Envoy's
+    /// error-handling behaviour.
+    ///
+    /// [`status_on_error`]: ExtProcConfig::status_on_error
+    fn call_or_reject(&self, result: Result<FilterAction, FilterError>) -> FilterAction {
+        match result {
+            Ok(action) => action,
+            Err(e) => {
+                tracing::warn!(
+                    target = %self.target,
+                    status = self.status_on_error,
+                    error = %e,
+                    "ext_proc: processor error, rejecting with status_on_error"
+                );
+                FilterAction::Reject(Rejection::status(self.status_on_error))
+            },
+        }
+    }
 }
 
 #[async_trait]
@@ -549,25 +571,29 @@ impl HttpFilter for ExtProcFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        callout::process_request_headers(
-            self.channel.clone(),
-            &self.target,
-            self.message_timeout,
-            self.max_message_timeout,
-            ctx,
-        )
-        .await
+        Ok(self.call_or_reject(
+            callout::process_request_headers(
+                self.channel.clone(),
+                &self.target,
+                self.message_timeout,
+                self.max_message_timeout,
+                ctx,
+            )
+            .await,
+        ))
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        callout::process_response_headers(
-            self.channel.clone(),
-            &self.target,
-            self.message_timeout,
-            self.max_message_timeout,
-            ctx,
-        )
-        .await
+        Ok(self.call_or_reject(
+            callout::process_response_headers(
+                self.channel.clone(),
+                &self.target,
+                self.message_timeout,
+                self.max_message_timeout,
+                ctx,
+            )
+            .await,
+        ))
     }
 }
 

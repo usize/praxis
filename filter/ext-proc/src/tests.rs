@@ -1722,6 +1722,36 @@ async fn grpc_timeout_returns_error() {
 }
 
 #[tokio::test]
+async fn grpc_timeout_with_filter_returns_status_on_error() {
+    let (addr, _guard) = start_mock_processor(MockBehavior::Hang).await;
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        r#"
+target: "http://{addr}"
+message_timeout_ms: 50
+status_on_error: 503
+"#,
+    ))
+    .unwrap();
+
+    let filter = ExtProcFilter::from_config(&yaml).unwrap();
+
+    let req = make_request(Method::GET, "/");
+    let mut ctx = make_ctx(&req);
+
+    let action = filter.on_request(&mut ctx).await.expect("should not return Err");
+
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert_eq!(
+        rejection.status, 503,
+        "rejection status should match configured status_on_error"
+    );
+}
+
+#[tokio::test]
 async fn grpc_override_timeout_extends_deadline() {
     let (addr, _guard) = start_mock_processor(MockBehavior::OverrideThenRespond {
         override_ms: 500,
