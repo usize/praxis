@@ -589,6 +589,13 @@ impl std::fmt::Debug for ExtProcFilter {
 /// Metadata key for the per-request stream ID.
 const STREAM_ID_KEY: &str = "ext_proc.stream_id";
 
+/// Metadata key set when `end_of_stream: true` was sent on headers.
+///
+/// When this flag is `"true"`, body hooks pass through without
+/// calling the external processor because the request lifecycle
+/// already completed at the header phase.
+const HEADERS_COMPLETE_KEY: &str = "ext_proc.headers_complete";
+
 /// Metadata key indicating a deferred header response is pending.
 ///
 /// Set to `"true"` when `on_request` sends headers without waiting
@@ -703,6 +710,48 @@ impl ExtProcFilter {
         action
     }
 
+    /// Check whether the request lifecycle completed at the header phase.
+    fn is_headers_complete(ctx: &HttpFilterContext<'_>) -> bool {
+        ctx.get_metadata(HEADERS_COMPLETE_KEY).is_some_and(|v| v == "true")
+    }
+
+    /// Dispatch response body processing, choosing the full-duplex
+    /// path when the body mode is `FullDuplexStreamed`.
+    fn dispatch_response_body(
+        &self,
+        handle: &StreamHandle,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        let full_duplex = self.processing_mode.response_body_mode == BodySendMode::FullDuplexStreamed;
+
+        if full_duplex && !end_of_stream {
+            callout::send_response_body_only(handle, &self.target, body, false)?;
+            Ok(FilterAction::Continue)
+        } else if full_duplex {
+            callout::send_response_body_only(handle, &self.target, body, true)?;
+            callout::receive_response_body(
+                handle,
+                &self.target,
+                self.message_timeout,
+                self.max_message_timeout,
+                ctx,
+                body,
+            )
+        } else {
+            callout::process_response_body(
+                handle,
+                &self.target,
+                self.message_timeout,
+                self.max_message_timeout,
+                ctx,
+                body,
+                end_of_stream,
+            )
+        }
+    }
+
     /// Retrieve the stream ID stored in filter metadata.
     fn get_stream_id(ctx: &HttpFilterContext<'_>) -> Result<u64, FilterError> {
         ctx.get_metadata(STREAM_ID_KEY)
@@ -774,6 +823,9 @@ impl HttpFilter for ExtProcFilter {
                 no_body,
             )
             .await;
+            if no_body {
+                ctx.set_metadata(HEADERS_COMPLETE_KEY, "true".to_owned());
+            }
             self.stream_handles.insert(stream_id, handle);
             Ok(self.call_or_reject(action))
         }
@@ -785,6 +837,10 @@ impl HttpFilter for ExtProcFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        if Self::is_headers_complete(ctx) {
+            return Ok(FilterAction::Continue);
+        }
+
         let stream_id = Self::get_stream_id(ctx)?;
 
         let handle = self
@@ -833,6 +889,13 @@ impl HttpFilter for ExtProcFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        if Self::is_headers_complete(ctx) {
+            if end_of_stream && let Ok(stream_id) = Self::get_stream_id(ctx) {
+                self.stream_handles.remove(&stream_id);
+            }
+            return Ok(FilterAction::Continue);
+        }
+
         let stream_id = Self::get_stream_id(ctx)?;
 
         let handle = self
@@ -840,15 +903,7 @@ impl HttpFilter for ExtProcFilter {
             .get(&stream_id)
             .ok_or_else(|| FilterError::from("ext_proc: stream handle not found for response body"))?;
 
-        let action = callout::process_response_body(
-            &handle,
-            &self.target,
-            self.message_timeout,
-            self.max_message_timeout,
-            ctx,
-            body,
-            end_of_stream,
-        );
+        let action = self.dispatch_response_body(&handle, ctx, body, end_of_stream);
 
         drop(handle);
 

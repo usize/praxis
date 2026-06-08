@@ -501,6 +501,45 @@ pub(crate) fn process_response_body(
     dispatch_body_response(&response, ctx, body, Phase::Response)
 }
 
+/// Send a response body chunk without waiting (blocking variant).
+///
+/// Used in `FULL_DUPLEX_STREAMED` mode for non-EOS response body
+/// chunks where the external processor buffers the body and does
+/// not respond until the full body is received.
+pub(crate) fn send_response_body_only(
+    handle: &StreamHandle,
+    target: &str,
+    body: &Option<Bytes>,
+    end_of_stream: bool,
+) -> Result<(), FilterError> {
+    let request = crate::mutations::response_body_to_request(body, end_of_stream);
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(send_without_response(handle, request, target))
+    })
+}
+
+/// Receive a response body response (blocking variant).
+///
+/// Used in `FULL_DUPLEX_STREAMED` mode at EOS after all body
+/// chunks have been sent via [`send_response_body_only`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "body phase requires handle, target, timeout, max_timeout, ctx, and body"
+)]
+pub(crate) fn receive_response_body(
+    handle: &StreamHandle,
+    target: &str,
+    timeout: Duration,
+    max_timeout: Option<Duration>,
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+) -> Result<FilterAction, FilterError> {
+    let response = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(receive_response(handle, timeout, max_timeout, target))
+    })?;
+    dispatch_body_response(&response, ctx, body, Phase::Response)
+}
+
 // -----------------------------------------------------------------------------
 // Response dispatch
 // -----------------------------------------------------------------------------
