@@ -773,7 +773,7 @@ fn request_to_proto_headers_includes_method_and_path() {
     let req = make_request(Method::POST, "/api/v1/users");
     let ctx = make_ctx(&req);
 
-    let proto = mutations::request_to_proto_headers(&ctx);
+    let proto = mutations::request_to_proto_headers(&ctx, false);
     let headers = proto.headers.unwrap().headers;
 
     let method = headers
@@ -794,7 +794,7 @@ fn request_to_proto_headers_preserves_query_string() {
     let req = make_request(Method::GET, "/search?q=secret&page=1");
     let ctx = make_ctx(&req);
 
-    let proto = mutations::request_to_proto_headers(&ctx);
+    let proto = mutations::request_to_proto_headers(&ctx, false);
     let headers = proto.headers.unwrap().headers;
 
     let path = headers.iter().find(|h| h.key == ":path").expect("should include :path");
@@ -809,7 +809,7 @@ fn request_to_proto_headers_includes_scheme() {
     let req = make_request(Method::GET, "/");
     let ctx = make_ctx(&req);
 
-    let proto = mutations::request_to_proto_headers(&ctx);
+    let proto = mutations::request_to_proto_headers(&ctx, false);
     let headers = proto.headers.unwrap().headers;
 
     let scheme = headers
@@ -825,7 +825,7 @@ fn request_to_proto_headers_includes_https_scheme() {
     let mut ctx = make_ctx(&req);
     ctx.downstream_tls = true;
 
-    let proto = mutations::request_to_proto_headers(&ctx);
+    let proto = mutations::request_to_proto_headers(&ctx, false);
     let headers = proto.headers.unwrap().headers;
 
     let scheme = headers
@@ -841,7 +841,7 @@ fn request_to_proto_headers_includes_authority() {
     req.headers.insert("host", "example.com".parse().unwrap());
     let ctx = make_ctx(&req);
 
-    let proto = mutations::request_to_proto_headers(&ctx);
+    let proto = mutations::request_to_proto_headers(&ctx, false);
     let headers = proto.headers.unwrap().headers;
 
     let authority = headers
@@ -856,7 +856,7 @@ fn request_to_proto_headers_omits_authority_when_no_host() {
     let req = make_request(Method::GET, "/");
     let ctx = make_ctx(&req);
 
-    let proto = mutations::request_to_proto_headers(&ctx);
+    let proto = mutations::request_to_proto_headers(&ctx, false);
     let headers = proto.headers.unwrap().headers;
 
     assert!(
@@ -872,7 +872,7 @@ fn request_to_proto_headers_includes_request_headers() {
     req.headers.insert("x-request-id", "abc-123".parse().unwrap());
     let ctx = make_ctx(&req);
 
-    let proto = mutations::request_to_proto_headers(&ctx);
+    let proto = mutations::request_to_proto_headers(&ctx, false);
     let headers = proto.headers.unwrap().headers;
 
     let ct = headers
@@ -900,7 +900,7 @@ fn response_to_proto_headers_includes_status() {
     let mut ctx = make_ctx(&req);
     ctx.response_header = Some(&mut resp);
 
-    let proto = mutations::response_to_proto_headers(&ctx);
+    let proto = mutations::response_to_proto_headers(&ctx, false);
     let headers = proto.headers.unwrap().headers;
 
     let status = headers
@@ -918,7 +918,7 @@ fn response_to_proto_headers_includes_response_headers() {
     let mut ctx = make_ctx(&req);
     ctx.response_header = Some(&mut resp);
 
-    let proto = mutations::response_to_proto_headers(&ctx);
+    let proto = mutations::response_to_proto_headers(&ctx, false);
     let headers = proto.headers.unwrap().headers;
 
     let hdr = headers
@@ -933,7 +933,7 @@ fn response_to_proto_headers_empty_when_no_response() {
     let req = make_request(Method::GET, "/");
     let ctx = make_ctx(&req);
 
-    let proto = mutations::response_to_proto_headers(&ctx);
+    let proto = mutations::response_to_proto_headers(&ctx, false);
     let headers = proto.headers.unwrap().headers;
     assert!(
         headers.is_empty(),
@@ -1785,7 +1785,7 @@ async fn grpc_request_headers_round_trip_applies_mutation() {
     let req = make_request(Method::GET, "/test");
     let mut ctx = make_ctx(&req);
 
-    let action = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx)
+    let action = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx, false)
         .await
         .expect("callout should succeed");
 
@@ -1820,7 +1820,7 @@ async fn grpc_response_headers_round_trip_applies_mutation() {
     let mut ctx = make_ctx(&req);
     ctx.response_header = Some(&mut resp);
 
-    let action = callout::process_response_headers(&handle, &addr.to_string(), timeout, None, &mut ctx)
+    let action = callout::process_response_headers(&handle, &addr.to_string(), timeout, None, &mut ctx, false)
         .await
         .expect("callout should succeed");
 
@@ -1853,7 +1853,7 @@ async fn grpc_immediate_response_returns_rejection() {
     let req = make_request(Method::GET, "/secret");
     let mut ctx = make_ctx(&req);
 
-    let action = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx)
+    let action = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx, false)
         .await
         .expect("callout should succeed");
 
@@ -1881,7 +1881,7 @@ async fn grpc_noop_response_returns_continue() {
     let req = make_request(Method::GET, "/");
     let mut ctx = make_ctx(&req);
 
-    let action = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx)
+    let action = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx, false)
         .await
         .expect("callout should succeed");
 
@@ -1907,7 +1907,7 @@ async fn grpc_unexpected_response_type_returns_error() {
 
     let handle = callout::open_stream(channel, addr.to_string());
 
-    let result = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx).await;
+    let result = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx, false).await;
 
     assert!(result.is_err(), "unexpected response type should return Err");
     let err = result.unwrap_err().to_string();
@@ -1930,7 +1930,7 @@ async fn grpc_phase_mismatched_response_returns_error() {
 
     let handle = callout::open_stream(channel, addr.to_string());
 
-    let result = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx).await;
+    let result = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx, false).await;
 
     assert!(result.is_err(), "phase-mismatched response should return Err");
     let err = result.unwrap_err().to_string();
@@ -1952,7 +1952,7 @@ async fn grpc_timeout_returns_error() {
     let req = make_request(Method::GET, "/");
     let mut ctx = make_ctx(&req);
 
-    let result = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx).await;
+    let result = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx, false).await;
 
     assert!(result.is_err(), "timed-out callout should return Err");
     let err = result.unwrap_err().to_string();
@@ -2007,7 +2007,7 @@ async fn grpc_override_timeout_extends_deadline() {
     let timeout = Duration::from_secs(5);
     let max_timeout = Some(Duration::from_secs(10));
 
-    let action = callout::process_request_headers(&handle, &addr.to_string(), timeout, max_timeout, &mut ctx)
+    let action = callout::process_request_headers(&handle, &addr.to_string(), timeout, max_timeout, &mut ctx, false)
         .await
         .expect("callout with override should succeed");
 
@@ -2039,7 +2039,7 @@ async fn grpc_override_ignored_without_max_timeout() {
     let mut ctx = make_ctx(&req);
     let timeout = Duration::from_secs(5);
 
-    let action = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx)
+    let action = callout::process_request_headers(&handle, &addr.to_string(), timeout, None, &mut ctx, false)
         .await
         .expect("callout should succeed");
 
@@ -2067,7 +2067,7 @@ async fn persistent_stream_full_lifecycle() {
     let req = make_request(Method::POST, "/api");
     let mut ctx = make_ctx(&req);
     assert_continue(
-        callout::process_request_headers(&handle, &target, timeout, None, &mut ctx).await,
+        callout::process_request_headers(&handle, &target, timeout, None, &mut ctx, false).await,
         "request headers",
     );
     let mut body = Some(Bytes::from("request-body"));
@@ -2078,7 +2078,7 @@ async fn persistent_stream_full_lifecycle() {
     let mut resp = make_response();
     ctx.response_header = Some(&mut resp);
     assert_continue(
-        callout::process_response_headers(&handle, &target, timeout, None, &mut ctx).await,
+        callout::process_response_headers(&handle, &target, timeout, None, &mut ctx, false).await,
         "response headers",
     );
     let mut body = Some(Bytes::from("response-body"));
@@ -2101,7 +2101,7 @@ async fn request_body_mutation_replaces_body() {
     let req = make_request(Method::POST, "/");
     let mut ctx = make_ctx(&req);
 
-    let _action = callout::process_request_headers(&handle, &target, timeout, None, &mut ctx)
+    let _action = callout::process_request_headers(&handle, &target, timeout, None, &mut ctx, false)
         .await
         .expect("headers should succeed");
 
@@ -2131,13 +2131,13 @@ async fn response_body_mutation_replaces_body() {
     let req = make_request(Method::GET, "/");
     let mut ctx = make_ctx(&req);
 
-    let _action = callout::process_request_headers(&handle, &target, timeout, None, &mut ctx)
+    let _action = callout::process_request_headers(&handle, &target, timeout, None, &mut ctx, false)
         .await
         .expect("request headers should succeed");
 
     let mut resp = make_response();
     ctx.response_header = Some(&mut resp);
-    let _action = callout::process_response_headers(&handle, &target, timeout, None, &mut ctx)
+    let _action = callout::process_response_headers(&handle, &target, timeout, None, &mut ctx, false)
         .await
         .expect("response headers should succeed");
 
@@ -2166,7 +2166,7 @@ async fn request_body_clear_body() {
     let req = make_request(Method::POST, "/");
     let mut ctx = make_ctx(&req);
 
-    let _action = callout::process_request_headers(&handle, &target, timeout, None, &mut ctx)
+    let _action = callout::process_request_headers(&handle, &target, timeout, None, &mut ctx, false)
         .await
         .expect("headers should succeed");
 
@@ -2196,7 +2196,7 @@ async fn immediate_response_during_body_phase() {
     let req = make_request(Method::POST, "/");
     let mut ctx = make_ctx(&req);
 
-    let _action = callout::process_request_headers(&handle, &target, timeout, None, &mut ctx)
+    let _action = callout::process_request_headers(&handle, &target, timeout, None, &mut ctx, false)
         .await
         .expect("headers should succeed");
 

@@ -496,6 +496,22 @@ fn validate_body_mode(field: &str, mode: BodySendMode) -> Result<(), FilterError
     }
 }
 
+/// Check whether the downstream request carries a body.
+///
+/// Returns `true` when a `content-length` header is present with a
+/// non-zero value or a `transfer-encoding` header is present
+/// (chunked). This mirrors how Envoy decides whether to set
+/// `end_of_stream: true` on the `RequestHeaders` message.
+fn request_has_body(ctx: &HttpFilterContext<'_>) -> bool {
+    if let Some(te) = ctx.request.headers.get(http::header::TRANSFER_ENCODING) {
+        return !te.is_empty();
+    }
+    if let Some(cl) = ctx.request.headers.get(http::header::CONTENT_LENGTH) {
+        return cl.to_str().is_ok_and(|v| v != "0");
+    }
+    false
+}
+
 // -----------------------------------------------------------------------------
 // ExtProcFilter
 // -----------------------------------------------------------------------------
@@ -573,6 +589,14 @@ impl std::fmt::Debug for ExtProcFilter {
 /// Metadata key for the per-request stream ID.
 const STREAM_ID_KEY: &str = "ext_proc.stream_id";
 
+/// Metadata key indicating a deferred header response is pending.
+///
+/// Set to `"true"` when `on_request` sends headers without waiting
+/// for a response in `FULL_DUPLEX_STREAMED` mode. Consumed by
+/// `on_request_body` which receives the deferred header response
+/// alongside the body response.
+const DEFERRED_HEADER_RESP_KEY: &str = "ext_proc.deferred_header_resp";
+
 impl ExtProcFilter {
     /// Create from parsed YAML config.
     ///
@@ -638,6 +662,47 @@ impl ExtProcFilter {
         }
     }
 
+    /// Dispatch request body processing, choosing the full-duplex
+    /// path when a deferred header response is pending.
+    async fn dispatch_request_body(
+        &self,
+        handle: &StreamHandle,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        let deferred = ctx.get_metadata(DEFERRED_HEADER_RESP_KEY).is_some_and(|v| v == "true");
+
+        let action = if deferred && end_of_stream {
+            callout::process_request_body_full_duplex(
+                handle,
+                &self.target,
+                self.message_timeout,
+                self.max_message_timeout,
+                ctx,
+                body,
+            )
+            .await
+        } else {
+            callout::process_request_body(
+                handle,
+                &self.target,
+                self.message_timeout,
+                self.max_message_timeout,
+                ctx,
+                body,
+                end_of_stream,
+            )
+            .await
+        };
+
+        if deferred && end_of_stream {
+            ctx.set_metadata(DEFERRED_HEADER_RESP_KEY, "false".to_owned());
+        }
+
+        action
+    }
+
     /// Retrieve the stream ID stored in filter metadata.
     fn get_stream_id(ctx: &HttpFilterContext<'_>) -> Result<u64, FilterError> {
         ctx.get_metadata(STREAM_ID_KEY)
@@ -685,18 +750,33 @@ impl HttpFilter for ExtProcFilter {
 
         let handle = callout::open_stream(self.channel(), self.target.clone());
 
-        let action = callout::process_request_headers(
-            &handle,
-            &self.target,
-            self.message_timeout,
-            self.max_message_timeout,
-            ctx,
-        )
-        .await;
+        let has_body = request_has_body(ctx);
+        let full_duplex = self.processing_mode.request_body_mode == BodySendMode::FullDuplexStreamed;
+        let no_body = self.processing_mode.request_body_mode == BodySendMode::None || !has_body;
 
-        self.stream_handles.insert(stream_id, handle);
-
-        Ok(self.call_or_reject(action))
+        if full_duplex && has_body {
+            // In FULL_DUPLEX_STREAMED mode with a body, send headers
+            // without waiting for a response. The external processor
+            // defers its header response until the body arrives. The
+            // deferred response is collected in `on_request_body`.
+            let headers = callout::build_request_headers(ctx, false);
+            callout::send_without_response(&handle, headers, &self.target).await?;
+            ctx.set_metadata(DEFERRED_HEADER_RESP_KEY, "true".to_owned());
+            self.stream_handles.insert(stream_id, handle);
+            Ok(FilterAction::Continue)
+        } else {
+            let action = callout::process_request_headers(
+                &handle,
+                &self.target,
+                self.message_timeout,
+                self.max_message_timeout,
+                ctx,
+                no_body,
+            )
+            .await;
+            self.stream_handles.insert(stream_id, handle);
+            Ok(self.call_or_reject(action))
+        }
     }
 
     async fn on_request_body(
@@ -712,16 +792,7 @@ impl HttpFilter for ExtProcFilter {
             .get(&stream_id)
             .ok_or_else(|| FilterError::from("ext_proc: stream handle not found for request body"))?;
 
-        let action = callout::process_request_body(
-            &handle,
-            &self.target,
-            self.message_timeout,
-            self.max_message_timeout,
-            ctx,
-            body,
-            end_of_stream,
-        )
-        .await;
+        let action = self.dispatch_request_body(&handle, ctx, body, end_of_stream).await;
 
         drop(handle);
 
@@ -740,12 +811,14 @@ impl HttpFilter for ExtProcFilter {
             .get(&stream_id)
             .ok_or_else(|| FilterError::from("ext_proc: stream handle not found for response headers"))?;
 
+        let no_body = self.processing_mode.response_body_mode == BodySendMode::None;
         let action = callout::process_response_headers(
             &handle,
             &self.target,
             self.message_timeout,
             self.max_message_timeout,
             ctx,
+            no_body,
         )
         .await;
 

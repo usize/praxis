@@ -39,7 +39,7 @@ use crate::Phase;
 /// pseudo-headers followed by all request headers, matching
 /// the Envoy `ext_proc` convention that external processors
 /// expect.
-pub(crate) fn request_to_proto_headers(ctx: &HttpFilterContext<'_>) -> HttpHeaders {
+pub(crate) fn request_to_proto_headers(ctx: &HttpFilterContext<'_>, end_of_stream: bool) -> HttpHeaders {
     let path = ctx
         .request
         .uri
@@ -63,7 +63,7 @@ pub(crate) fn request_to_proto_headers(ctx: &HttpFilterContext<'_>) -> HttpHeade
 
     HttpHeaders {
         headers: Some(praxis_proto::envoy::service::ext_proc::v3::HeaderMap { headers }),
-        end_of_stream: false,
+        end_of_stream,
     }
 }
 
@@ -72,7 +72,7 @@ pub(crate) fn request_to_proto_headers(ctx: &HttpFilterContext<'_>) -> HttpHeade
 /// Includes a `:status` pseudo-header followed by all response
 /// headers. Returns empty headers when `ctx.response_header` is
 /// `None` (should not happen during the response phase).
-pub(crate) fn response_to_proto_headers(ctx: &HttpFilterContext<'_>) -> HttpHeaders {
+pub(crate) fn response_to_proto_headers(ctx: &HttpFilterContext<'_>, end_of_stream: bool) -> HttpHeaders {
     let mut headers = Vec::new();
 
     if let Some(resp) = ctx.response_header.as_ref() {
@@ -93,7 +93,7 @@ pub(crate) fn response_to_proto_headers(ctx: &HttpFilterContext<'_>) -> HttpHead
 
     HttpHeaders {
         headers: Some(praxis_proto::envoy::service::ext_proc::v3::HeaderMap { headers }),
-        end_of_stream: false,
+        end_of_stream,
     }
 }
 

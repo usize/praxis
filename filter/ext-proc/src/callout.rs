@@ -169,6 +169,59 @@ async fn run_stream(
 // Send / receive helpers
 // -----------------------------------------------------------------------------
 
+/// Send a request on the stream without waiting for a response.
+///
+/// Used in `FULL_DUPLEX_STREAMED` mode where the external processor
+/// defers its header response until the request body arrives. The
+/// caller is responsible for receiving the deferred response later
+/// (typically during body processing).
+pub(crate) async fn send_without_response(
+    handle: &StreamHandle,
+    request: ProcessingRequest,
+    target: &str,
+) -> Result<(), FilterError> {
+    handle.sender.send(request).await.map_err(|_closed| {
+        tracing::warn!(target = %target, "ext_proc channel closed during send");
+        FilterError::from("ext_proc: channel closed during fire-and-forget send")
+    })
+}
+
+/// Receive one response from the stream with a timeout.
+///
+/// Used after [`send_without_response`] to retrieve a deferred
+/// response from the external processor. Handles
+/// `override_message_timeout` the same way as
+/// [`send_and_receive_async`].
+pub(crate) async fn receive_response(
+    handle: &StreamHandle,
+    timeout: Duration,
+    max_timeout: Option<Duration>,
+    target: &str,
+) -> Result<ProcessingResponse, FilterError> {
+    let result = tokio::time::timeout(timeout, async {
+        let mut rx = handle.receiver.lock().await;
+        let resp = rx.recv().await.ok_or(CalloutError::EmptyStream)?;
+        let result = receive_with_override(&mut rx, resp, max_timeout, target).await;
+
+        drop(rx);
+
+        result
+    })
+    .await;
+
+    match result {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(e)) => {
+            tracing::warn!(target = %target, error = %e, "ext_proc receive failed");
+            Err(e.into())
+        },
+        Err(_elapsed) => {
+            tracing::warn!(target = %target, "ext_proc receive timed out");
+            Err(CalloutError::Timeout.into())
+        },
+    }
+}
+
 /// Send a request and await the response asynchronously with a timeout.
 ///
 /// Used by async filter hooks (`on_request`, `on_request_body`,
@@ -294,18 +347,36 @@ fn parse_timeout_override(resp: &ProcessingResponse, max_timeout: Option<Duratio
 // Header processing (using persistent stream)
 // -----------------------------------------------------------------------------
 
+/// Build a `ProcessingRequest` wrapping request headers.
+///
+/// Separated from [`process_request_headers`] so that callers in
+/// `FULL_DUPLEX_STREAMED` mode can send headers via
+/// [`send_without_response`] and defer the response.
+pub(crate) fn build_request_headers(ctx: &HttpFilterContext<'_>, end_of_stream: bool) -> ProcessingRequest {
+    let headers = request_to_proto_headers(ctx, end_of_stream);
+    ProcessingRequest {
+        request: Some(processing_request::Request::RequestHeaders(headers)),
+        ..Default::default()
+    }
+}
+
 /// Send request headers on the persistent stream and apply mutations.
 ///
 /// Sends a `RequestHeaders` message, waits for one response within
 /// `timeout`, and applies header mutations or returns a rejection.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "header phase requires handle, target, timeout, max_timeout, ctx, and eos"
+)]
 pub(crate) async fn process_request_headers(
     handle: &StreamHandle,
     target: &str,
     timeout: Duration,
     max_timeout: Option<Duration>,
     ctx: &mut HttpFilterContext<'_>,
+    end_of_stream: bool,
 ) -> Result<FilterAction, FilterError> {
-    let headers = request_to_proto_headers(ctx);
+    let headers = request_to_proto_headers(ctx, end_of_stream);
     let request = ProcessingRequest {
         request: Some(processing_request::Request::RequestHeaders(headers)),
         ..Default::default()
@@ -319,14 +390,19 @@ pub(crate) async fn process_request_headers(
 ///
 /// Same pattern as [`process_request_headers`] but wraps
 /// `ResponseHeaders` and operates during the response phase.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "header phase requires handle, target, timeout, max_timeout, ctx, and eos"
+)]
 pub(crate) async fn process_response_headers(
     handle: &StreamHandle,
     target: &str,
     timeout: Duration,
     max_timeout: Option<Duration>,
     ctx: &mut HttpFilterContext<'_>,
+    end_of_stream: bool,
 ) -> Result<FilterAction, FilterError> {
-    let headers = response_to_proto_headers(ctx);
+    let headers = response_to_proto_headers(ctx, end_of_stream);
     let request = ProcessingRequest {
         request: Some(processing_request::Request::ResponseHeaders(headers)),
         ..Default::default()
@@ -360,6 +436,45 @@ pub(crate) async fn process_request_body(
     let request = crate::mutations::request_body_to_request(body, end_of_stream);
     let response = send_and_receive_async(handle, request, timeout, max_timeout, target).await?;
     dispatch_body_response(&response, ctx, body, Phase::Request)
+}
+
+/// Process the final request body chunk in `FULL_DUPLEX_STREAMED` mode.
+///
+/// In this mode, `on_request` sent headers without waiting for a
+/// response. The external processor defers its header response until
+/// the body arrives. This function:
+///
+/// 1. Sends the body chunk with `end_of_stream: true`
+/// 2. Receives the deferred header response and applies mutations
+/// 3. Receives the body response and applies mutations
+///
+/// This matches the llm-d EPP protocol where the processor responds
+/// to `RequestHeaders` + `RequestBody(EOS)` with a `HeadersResponse`
+/// followed by a `BodyResponse` on the same stream.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "body phase requires handle, target, timeout, max_timeout, ctx, and body"
+)]
+pub(crate) async fn process_request_body_full_duplex(
+    handle: &StreamHandle,
+    target: &str,
+    timeout: Duration,
+    max_timeout: Option<Duration>,
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+) -> Result<FilterAction, FilterError> {
+    let request = crate::mutations::request_body_to_request(body, true);
+    send_without_response(handle, request, target).await?;
+
+    // Receive the deferred header response and apply mutations.
+    // The action from header processing is intentionally not returned
+    // since the body response action takes precedence in full-duplex.
+    let header_resp = receive_response(handle, timeout, max_timeout, target).await?;
+    let _header_action = dispatch_response(&header_resp, ctx, Phase::Request)?;
+
+    // Receive the body response.
+    let body_resp = receive_response(handle, timeout, max_timeout, target).await?;
+    dispatch_body_response(&body_resp, ctx, body, Phase::Request)
 }
 
 /// Process a response body chunk on the persistent stream (blocking).
