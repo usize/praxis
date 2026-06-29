@@ -43,4 +43,5 @@ docs/**/
 !docs/filters/tcp/
 !docs/filters/tcp/*/
 !docs/operating/
+!docs/experiments/
 !docs/proposals/
