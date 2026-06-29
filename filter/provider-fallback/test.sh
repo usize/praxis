@@ -17,7 +17,7 @@ PROXY_PORT=8070
 OLLAMA_URL="http://127.0.0.1:11434"
 OLLAMA_MODEL="qwen2.5:3b"
 OPENROUTER_BASE="${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}"
-OPENROUTER_MODEL="qwen/qwen3-coder:free"
+OPENROUTER_MODEL="openrouter/auto"
 
 # ── Preflight Checks ─────────────────────────────────────────────
 
@@ -79,7 +79,7 @@ filter_chains:
             timeout_ms: 30000
           - url: "${OPENROUTER_BASE}/chat/completions"
             model_override: "${OPENROUTER_MODEL}"
-            timeout_ms: 30000
+            timeout_ms: 60000
             headers:
               Authorization: "Bearer ${OPENROUTER_API_KEY}"
 YAML
