@@ -2,8 +2,9 @@
 # Provider Fallback Filter — Local Test Harness
 #
 # Prerequisites:
-#   - Ollama running locally (ollama serve)
+#   - Ollama running locally (ollama serve) with qwen2.5:3b
 #   - OPENROUTER_API_KEY set in environment
+#   - Optionally OPENROUTER_BASE_URL (defaults to https://openrouter.ai/api/v1)
 #   - Praxis built (cargo build -p praxis-proxy)
 #
 # Usage:
@@ -14,8 +15,9 @@ set -euo pipefail
 
 PROXY_PORT=8070
 OLLAMA_URL="http://127.0.0.1:11434"
-OLLAMA_MODEL="llama3.2:1b"
-OPENROUTER_MODEL="nvidia/llama-nemotron-rerank-vl-1b-v2:free"
+OLLAMA_MODEL="qwen2.5:3b"
+OPENROUTER_BASE="${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}"
+OPENROUTER_MODEL="qwen/qwen3-coder:free"
 
 # ── Preflight Checks ─────────────────────────────────────────────
 
@@ -30,7 +32,7 @@ if curl -sf "${OLLAMA_URL}/api/tags" > /dev/null 2>&1; then
     echo "    Ollama is running"
 
     # Check if model is available
-    if curl -sf "${OLLAMA_URL}/api/tags" | grep -q "${OLLAMA_MODEL}"; then
+    if curl -sf "${OLLAMA_URL}/api/tags" | grep -q "qwen2.5"; then
         echo "    Model ${OLLAMA_MODEL} is available"
     else
         echo "    Model ${OLLAMA_MODEL} not found — pulling it now ..."
@@ -45,6 +47,8 @@ else
 fi
 
 echo "==> OPENROUTER_API_KEY is set (${#OPENROUTER_API_KEY} chars)"
+echo "==> OpenRouter base URL: ${OPENROUTER_BASE}"
+echo "==> OpenRouter model: ${OPENROUTER_MODEL}"
 echo ""
 
 # ── Generate Config ──────────────────────────────────────────────
@@ -73,7 +77,7 @@ filter_chains:
           - url: "${OLLAMA_URL}/v1/chat/completions"
             model_override: "${OLLAMA_MODEL}"
             timeout_ms: 30000
-          - url: "https://openrouter.ai/api/v1/chat/completions"
+          - url: "${OPENROUTER_BASE}/chat/completions"
             model_override: "${OPENROUTER_MODEL}"
             timeout_ms: 30000
             headers:
@@ -110,8 +114,9 @@ echo "    -H 'Content-Type: application/json' \\"
 echo "    -H 'X-Request-Id: test-001' \\"
 echo "    -d '{\"model\":\"any\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 2+2?\"}]}' | jq ."
 echo ""
-echo "  # Force Ollama failure (stop ollama, then re-run curl):"
-echo "  # The filter will fall back to OpenRouter"
+echo "  # Force fallback (stop Ollama, then re-run curl):"
+echo "  #   ollama stop"
+echo "  #   <run curl again — should hit OpenRouter>"
 echo "──────────────────────────────────────────────────────────────"
 echo ""
 
