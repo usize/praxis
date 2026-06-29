@@ -33,8 +33,8 @@ use tracing::{debug, info, warn};
 /// Default maximum request body size (10 MiB).
 const DEFAULT_MAX_BODY_BYTES: usize = 10_485_760; // 10 MiB
 
-/// Default per-target request timeout (30 s).
-const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+/// Default per-target request timeout.
+const DEFAULT_TIMEOUT_MS: u64 = 30_000; // 30 seconds
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -295,18 +295,8 @@ async fn try_one_target(target: &ResolvedTarget, idx: usize, ctx: &DispatchConte
             log_target_success(ctx.request_id, idx, target, &response);
             Some(success_to_rejection(response))
         },
-        CalloutResult::Failed => {
-            warn!(request_id = ctx.request_id, target_index = idx, target = %target.url, "provider_fallback: target failed");
-            None
-        },
-        CalloutResult::Rejected(rejection) => {
-            warn!(
-                request_id = ctx.request_id,
-                target_index = idx,
-                target = %target.url,
-                status = rejection.status,
-                "provider_fallback: target rejected"
-            );
+        other => {
+            log_target_failure(ctx.request_id, idx, target, &other);
             None
         },
     }
@@ -322,6 +312,26 @@ fn log_target_success(request_id: &str, idx: usize, target: &ResolvedTarget, res
         response_bytes = response.body.len(),
         "provider_fallback: target responded successfully"
     );
+}
+
+/// Log a failed or rejected target attempt at warn level.
+fn log_target_failure(request_id: &str, idx: usize, target: &ResolvedTarget, result: &CalloutResult) {
+    if let CalloutResult::Rejected(r) = result {
+        warn!(
+            request_id,
+            target_index = idx,
+            target = %target.url,
+            status = r.status,
+            "provider_fallback: target rejected"
+        );
+    } else {
+        warn!(
+            request_id,
+            target_index = idx,
+            target = %target.url,
+            "provider_fallback: target failed"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------------
