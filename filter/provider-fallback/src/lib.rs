@@ -24,7 +24,7 @@ use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
 };
 use serde::Deserialize;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -154,6 +154,14 @@ impl ProviderFallbackFilter {
             .map(|t| resolve_target(t, cb_cfg.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
 
+        let target_urls: Vec<&str> = targets.iter().map(|t| t.url.as_str()).collect();
+        info!(
+            target_count = targets.len(),
+            targets = ?target_urls,
+            max_body_bytes = cfg.max_body_bytes,
+            "provider_fallback: filter initialized"
+        );
+
         Ok(Box::new(Self {
             targets,
             max_body_bytes: cfg.max_body_bytes,
@@ -202,8 +210,24 @@ impl HttpFilter for ProviderFallbackFilter {
         let request_body = body.as_ref().map_or_else(Vec::new, |b| b.to_vec());
         let method = ctx.request.method.clone();
         let forward_headers = collect_forward_headers(ctx);
+        let request_id = ctx.request_id().unwrap_or("-");
 
-        try_targets(&self.targets, &method, &request_body, &forward_headers).await
+        debug!(
+            request_id,
+            method = %method,
+            body_bytes = request_body.len(),
+            target_count = self.targets.len(),
+            "provider_fallback: dispatching request"
+        );
+
+        let dispatch = DispatchContext {
+            method: &method,
+            body: &request_body,
+            forward_headers: &forward_headers,
+            request_id,
+        };
+
+        try_targets(&self.targets, &dispatch).await
     }
 }
 
@@ -211,32 +235,93 @@ impl HttpFilter for ProviderFallbackFilter {
 // Core Dispatch
 // -----------------------------------------------------------------------------
 
-/// Try each target in order, returning the first 2xx response.
-async fn try_targets(
-    targets: &[ResolvedTarget],
-    method: &http::Method,
-    body: &[u8],
-    forward_headers: &[(HeaderName, HeaderValue)],
-) -> Result<FilterAction, FilterError> {
-    for target in targets {
-        let callout_body = prepare_body(body, target.model_override.as_deref());
-        let request = build_callout_request(method, &target.url, forward_headers, &target.headers, callout_body);
+/// Per-request dispatch context passed through the target loop.
+struct DispatchContext<'a> {
+    /// Original request method.
+    method: &'a http::Method,
 
-        match target.client.execute(request).await {
-            CalloutResult::Success(response) => {
-                return Ok(success_to_rejection(response));
-            },
-            CalloutResult::Failed | CalloutResult::Rejected(_) => {
-                warn!(target = %target.url, "provider target unavailable, trying next");
-            },
+    /// Buffered request body.
+    body: &'a [u8],
+
+    /// Headers forwarded from the original request.
+    forward_headers: &'a [(HeaderName, HeaderValue)],
+
+    /// Request ID for log correlation.
+    request_id: &'a str,
+}
+
+/// Try each target in order, returning the first 2xx response.
+async fn try_targets(targets: &[ResolvedTarget], dispatch: &DispatchContext<'_>) -> Result<FilterAction, FilterError> {
+    for (idx, target) in targets.iter().enumerate() {
+        if let Some(action) = try_one_target(target, idx, dispatch).await {
+            return Ok(action);
         }
     }
+
+    warn!(
+        request_id = dispatch.request_id,
+        targets_tried = targets.len(),
+        "provider_fallback: all targets exhausted, returning 502"
+    );
 
     Ok(FilterAction::Reject(
         Rejection::status(502)
             .with_header("content-type", "text/plain")
             .with_body("all provider targets exhausted"),
     ))
+}
+
+/// Attempt a single target. Returns `Some(action)` on success,
+/// `None` to signal the caller to try the next target.
+async fn try_one_target(target: &ResolvedTarget, idx: usize, ctx: &DispatchContext<'_>) -> Option<FilterAction> {
+    let callout_body = prepare_body(ctx.body, target.model_override.as_deref());
+    let request = build_callout_request(
+        ctx.method,
+        &target.url,
+        ctx.forward_headers,
+        &target.headers,
+        callout_body,
+    );
+
+    debug!(
+        request_id = ctx.request_id,
+        target_index = idx,
+        target = %target.url,
+        "provider_fallback: trying target"
+    );
+
+    match target.client.execute(request).await {
+        CalloutResult::Success(response) => {
+            log_target_success(ctx.request_id, idx, target, &response);
+            Some(success_to_rejection(response))
+        },
+        CalloutResult::Failed => {
+            warn!(request_id = ctx.request_id, target_index = idx, target = %target.url, "provider_fallback: target failed");
+            None
+        },
+        CalloutResult::Rejected(rejection) => {
+            warn!(
+                request_id = ctx.request_id,
+                target_index = idx,
+                target = %target.url,
+                status = rejection.status,
+                "provider_fallback: target rejected"
+            );
+            None
+        },
+    }
+}
+
+/// Log a successful target response at info level.
+fn log_target_success(request_id: &str, idx: usize, target: &ResolvedTarget, response: &CalloutResponse) {
+    info!(
+        request_id,
+        target_index = idx,
+        target = %target.url,
+        status = response.status,
+        response_bytes = response.body.len(),
+        "provider_fallback: target responded successfully"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -312,12 +397,21 @@ fn prepare_body(body: &[u8], model_override: Option<&str>) -> Vec<u8> {
     };
 
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        warn!("model_override set but body is not valid JSON; forwarding as-is");
+        warn!(
+            model,
+            "provider_fallback: model_override set but body is not valid JSON; forwarding as-is"
+        );
         return body.to_vec();
     };
 
     if let Some(obj) = value.as_object_mut() {
+        let original = obj.get("model").and_then(serde_json::Value::as_str).map(str::to_owned);
         obj.insert("model".to_owned(), serde_json::Value::String(model.to_owned()));
+        debug!(
+            original_model = ?original,
+            override_model = model,
+            "provider_fallback: rewrote model field"
+        );
     }
 
     serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
