@@ -78,10 +78,7 @@ The `provider_fallback` filter sidesteps this by owning
 the full request lifecycle for its targets. Each target
 is a self-contained provider definition (URL, headers,
 model override, timeout) with its own `CalloutClient` and
-circuit breaker. This is the right trade-off: fallback
-targets are a fundamentally different concern from the
-pipeline's policy filters and should not be threaded
-through the existing routing/credential/model primitives.
+circuit breaker.
 
 ### What we lack
 
