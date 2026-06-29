@@ -25,6 +25,7 @@ clap = { workspace = true }
 notify = { workspace = true }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
+praxis-provider-fallback = { workspace = true }
 praxis-protocol = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }

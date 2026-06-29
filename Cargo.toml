@@ -8,6 +8,7 @@ members = [
     "core",
     "filter",
     "filter/ext-proc",
+    "filter/provider-fallback",
     "filter/proto",
     "protocol",
     "tls",
@@ -55,6 +56,7 @@ pingora-http = { version = "0.8.2", package = "quixotic-plecostomus-http" }
 pingora-proxy = { version = "0.8.2", package = "quixotic-plecostomus-proxy", features = ["rustls"] }
 percent-encoding = "2.3.2"
 praxis-ext-proc = { version = "0.3.1", path = "filter/ext-proc", package = "praxis-proxy-ext-proc" }
+praxis-provider-fallback = { version = "0.3.1", path = "filter/provider-fallback", package = "praxis-proxy-provider-fallback" }
 praxis-proto = { version = "0.3.1", path = "filter/proto", package = "praxis-proxy-proto" }
 prost = "0.14.4"
 prost-build = "0.14.4"

@@ -1,0 +1,32 @@
+[package]
+name = "praxis-proxy-provider-fallback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Provider fallback filter for Praxis"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "praxis_provider_fallback"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+http.workspace = true
+praxis-core = { workspace = true, features = ["callout"] }
+praxis-filter.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[package.metadata.praxis-filters]

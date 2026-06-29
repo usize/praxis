@@ -2476,6 +2476,7 @@ dependencies = [
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-protocol",
+ "praxis-proxy-provider-fallback",
  "serde",
  "tempfile",
  "tikv-jemallocator",
@@ -2490,6 +2491,7 @@ name = "praxis-proxy-core"
 version = "0.3.1"
 dependencies = [
  "dashmap 6.2.1",
+ "http",
  "praxis-proxy-tls",
  "quixotic-plecostomus-core",
  "rand 0.10.1",
@@ -2589,6 +2591,22 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tracing",
+ "yaml_serde",
+]
+
+[[package]]
+name = "praxis-proxy-provider-fallback"
+version = "0.3.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http",
+ "praxis-proxy-core",
+ "praxis-proxy-filter",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
  "yaml_serde",
 ]
