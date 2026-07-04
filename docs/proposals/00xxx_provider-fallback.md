@@ -173,5 +173,291 @@ For Praxis, the achievable and correct target is:
 
 ## How?
 
-> **Note:** Submit What? and Why? first. Add How? in a
-> follow-up PR after the proposal direction is accepted.
+### Core design insight
+
+The pipeline's contract changes from "mutate shared state"
+to "emit a plan." Each target's complete upstream request is
+derived as a pure function of (original request + target
+config). Nothing is shared between attempts, so nothing
+needs rollback. The pipeline keeps its invariant: every
+filter executes at most once, forward-only.
+
+### Requirements
+
+1. **Prepared targets** — the filter builds each target's
+   complete upstream state (peer, headers, body with model
+   rewritten) from the original request snapshot,
+   independently per target. No shared mutable state
+   between attempts.
+
+2. **Pingora-native dispatch** — use Pingora's existing
+   retry loop (`proxy_to_upstream` → `error_while_proxy` →
+   retry check → `upstream_peer`). No standalone connector
+   usage. Provider targets get connection pooling, HTTP/2,
+   TLS, backpressure, and streaming for free.
+
+3. **Response-header-based retry** — extend retry to cover
+   retriable upstream statuses (5xx, 429) in addition to
+   connection failures. Intercept in `response_filter`
+   (before headers are committed downstream) and
+   `error_while_proxy`.
+
+4. **Streaming responses** — the winning target's response
+   flows through Pingora's normal response pipeline.
+   `response_body_filter` streams chunks to the client.
+   Response-phase filters (token counting, access logging)
+   see the response normally.
+
+5. **No pipeline replay** — request-phase filters execute
+   once. The fallback filter is the last provider-affecting
+   step. Credential injection and model rewrite are NOT in
+   the pipeline for fallback routes — the plan carries
+   everything.
+
+6. **Callout/provider separation** — `CalloutClient`
+   (reqwest) stays unchanged for side-channel callouts
+   where isolation is a security property. Provider targets
+   use Pingora's upstream machinery. Different primitives,
+   not a config toggle.
+
+### Design
+
+#### New types
+
+New types live in `filter/src/fallback.rs` or a similar
+module-level file.
+
+```rust
+/// A complete, pre-built fallback plan emitted by the filter.
+struct FallbackPlan {
+    targets: Vec<PreparedTarget>,
+    current: usize,                  // index of next target to try
+    retry_on: Vec<u16>,              // retriable status codes [502, 503, 429]
+    ttfb_timeout: Duration,          // per-attempt time-to-first-byte
+    total_deadline: Instant,         // absolute deadline across all attempts
+    attempts: Vec<Attempt>,          // observability: what happened per target
+}
+
+/// A target with everything pre-resolved. Pure function of
+/// (original request snapshot + target config).
+struct PreparedTarget {
+    upstream: Upstream,              // address, TLS, connection options
+    extra_headers: Vec<(HeaderName, HeaderValue)>,  // Authorization, etc.
+    body: Bytes,                     // with model field already rewritten
+    model_name: Option<String>,      // for observability
+}
+
+/// Record of one attempt for logging/metrics.
+struct Attempt {
+    target_index: usize,
+    status: Option<u16>,             // None if connection failed
+    duration: Duration,
+}
+```
+
+`FallbackPlan` is stored in `ctx.extensions` via
+[`RequestExtensions::insert`] (see
+`filter/src/extensions.rs`). The type-map keying ensures
+no collisions with other filters.
+
+#### Filter changes (`provider_fallback` filter)
+
+The filter (`filter/provider-fallback/src/lib.rs`) changes
+from terminal (returning `FilterAction::Reject` with a
+buffered response) to plan-emitting (returning
+`FilterAction::Continue` after depositing a `FallbackPlan`
+in extensions).
+
+In `on_request_body` (when `end_of_stream`):
+
+1. Parse the buffered JSON body once.
+2. For each configured target: serialize the body with that
+   target's model name, resolve headers, build `Upstream`
+   from the target URL.
+3. Build a `FallbackPlan` with all `PreparedTarget`s.
+4. Insert it into `ctx.extensions`.
+5. Set `ctx.cluster` and `ctx.upstream` to the FIRST target
+   (so the normal `upstream_peer` path works on the initial
+   attempt).
+6. Set `ctx.extra_request_headers` for the first target's
+   credentials.
+7. Return `FilterAction::Continue` — let Pingora handle the
+   upstream connection and response lifecycle.
+
+The filter is no longer terminal. It sets up the plan and
+lets the normal upstream lifecycle proceed. If the first
+target succeeds, the plan is never consulted again.
+
+#### Protocol layer changes
+
+Three existing hooks and one new override are modified in
+`protocol/src/http/pingora/handler/with_body.rs` (and
+the shared utilities in `handler/mod.rs`).
+
+**`upstream_peer`** (`handler/upstream_peer.rs`) — check
+for `FallbackPlan`, advance to current target:
+
+```text
+if plan exists AND current > 0:
+    set ctx.upstream from plan.targets[current]
+    clear ctx.upstream_for_retry (force peer rebuild)
+    apply per-target extra_headers to session
+proceed with existing upstream_peer::execute()
+```
+
+This works because `upstream_peer::execute` already handles
+the `ctx.upstream` → `ctx.upstream_for_retry` → `HttpPeer`
+conversion (see `handler/upstream_peer.rs:29-43`). Clearing
+`upstream_for_retry` forces it to re-read from the new
+`ctx.upstream`.
+
+**`response_filter`** (`handler/response_filter.rs`) —
+intercept retriable statuses before headers are committed
+downstream:
+
+```text
+run normal response pipeline
+if plan exists AND status matches retry_on
+   AND plan.has_next() AND !past deadline:
+    record attempt
+    return Err (retriable)
+```
+
+This must happen before `session.write_response_header`
+commits the response to the client. The existing
+`response_filter::execute` runs pipeline filters and syncs
+headers but does not commit — Pingora does that after the
+hook returns `Ok(())`. Returning `Err` prevents the commit.
+
+**`error_while_proxy`** (new override in `with_body.rs`) —
+advance plan on retriable error:
+
+```text
+if plan exists AND plan.has_next():
+    advance plan.current
+    set retry(true)
+    return error
+fall through to existing handle_connect_failure
+```
+
+This is a new `ProxyHttp` hook override. The existing
+handler does not implement `error_while_proxy`; it uses
+`fail_to_connect` for connection failures. The
+`error_while_proxy` hook covers errors that occur after a
+connection is established (including when `response_filter`
+returns `Err` to trigger a retry on a retriable status).
+
+**`fail_to_connect`** (`with_body.rs:183-191`) — same plan
+advancement for connection-level failures:
+
+```text
+if plan exists AND plan.has_next():
+    record attempt (connection failed)
+    advance plan.current
+    set retry(true)
+    return error
+fall through to existing handle_connect_failure logic
+```
+
+The existing `handle_connect_failure`
+(`handler/mod.rs:227-258`) only retries idempotent requests
+and enforces `RETRY_BODY_LIMIT` (64 KiB). For fallback
+targets, the plan overrides both constraints — the filter
+explicitly opted in by creating a plan, and the per-target
+body is pre-built (not replayed from Pingora's retry
+buffer).
+
+**`upstream_request_filter`** (`with_body.rs:193-210`) —
+apply per-target headers and body:
+
+```text
+existing hop-by-hop stripping, path rewrite, etc.
+if plan exists:
+    apply plan.targets[current].extra_headers
+    (body already set via pre_read_body mechanism)
+```
+
+#### Body handling
+
+The request body varies per target (model rewrite). Pingora's
+retry replays from its internal retry buffer, but that buffer
+holds the ORIGINAL body. For fallback, we need the per-target
+body.
+
+Approach: the `pre_read_body` mechanism already exists for
+`StreamBuffer` mode (see
+`handler/request_filter/stream_buffer.rs:84-211`). The filter
+stores the per-target body in the plan. On retry,
+`request_body_filter` checks the plan and substitutes the
+current target's body into the `pre_read_body` queue
+(`ctx.pre_read_body: Option<VecDeque<Bytes>>`, see
+`context.rs:140`). This needs investigation — Pingora's retry
+buffer behavior with `StreamBuffer` pre-read bodies may need
+careful handling.
+
+**This is the riskiest part of the design and should be
+prototyped first.** See open question 1.
+
+### Implementation sequence
+
+**PR 1: Types and filter** — `FallbackPlan`,
+`PreparedTarget`, updated `provider_fallback` filter that
+emits a plan instead of making callouts. Unit tests for
+plan construction, model rewriting, header resolution.
+
+**PR 2: Protocol layer — connection failure fallback** —
+`upstream_peer`, `fail_to_connect` changes. Integration
+test with two backends, first refusing connections.
+
+**PR 3: Protocol layer — response-header retry** —
+`response_filter`, `error_while_proxy` changes. Integration
+test with first backend returning 503, second returning 200.
+
+**PR 4: Per-target body replay** — `request_body_filter` /
+`upstream_request_filter` changes for model-rewritten
+bodies. Integration test verifying different model fields
+reach different backends.
+
+### Open questions
+
+1. **Pingora retry buffer + StreamBuffer interaction** —
+   when `StreamBuffer` pre-reads the body and Pingora
+   retries, does Pingora replay from its own buffer or from
+   `pre_read_body`? If from its own buffer, the per-target
+   body won't reach the retry target. The existing
+   `request_body_filter` forwards chunks from
+   `ctx.pre_read_body` (see
+   `handler/request_body_filter.rs:44-52`), but it's
+   unclear whether Pingora re-invokes `request_body_filter`
+   on retry or replays from its internal 64 KiB buffer
+   (`RETRY_BODY_LIMIT`, `handler/mod.rs:59`). Needs source
+   reading and testing.
+
+2. **Per-target extra_headers in upstream_request_filter** —
+   the filter sets `ctx.extra_request_headers` for the first
+   target during `on_request_body`. On retry for subsequent
+   targets, those headers are stale. The protocol layer
+   needs to swap them from the plan in
+   `upstream_request_filter`. This is a variant of the
+   credential leakage concern — but contained to the
+   protocol layer (one place, not distributed across
+   filters).
+
+3. **Retry budget vs. Pingora's max_retries** — Pingora's
+   retry loop has its own `max_retries` (128 by default).
+   The `FallbackPlan` has its own budget (number of
+   targets). These need to be coordinated — the plan budget
+   should be the effective limit. The existing
+   `handle_connect_failure` uses `MAX_RETRIES` (3, see
+   `handler/mod.rs:52`) and a retry counter
+   (`ctx.retries`, `context.rs:194`). The fallback plan
+   should take over the retry counter when present.
+
+4. **Non-idempotency** — inference POSTs aren't idempotent.
+   The existing retry logic skips non-idempotent requests
+   (`handler/mod.rs:228`). For fallback, we override this
+   (the filter explicitly opts in by creating a plan). But
+   double-billing is a real edge (provider processed, then
+   500'd). The proposal should acknowledge this and
+   recommend `Idempotency-Key` passthrough for providers
+   that support it.
