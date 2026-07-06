@@ -1,6 +1,5 @@
 ---
-issue: # TBD
-discussion: # TBD
+issue: https://github.com/praxis-proxy/ai/issues/249
 status: proposed
 authors:
   - usize
